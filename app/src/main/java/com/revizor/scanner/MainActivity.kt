@@ -32,6 +32,7 @@ import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
@@ -50,6 +51,8 @@ import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import com.google.mlkit.vision.barcode.BarcodeScanner
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
@@ -93,6 +96,7 @@ class MainActivity : AppCompatActivity() {
 
     // Главный экран камеры
     private lateinit var topBar: LinearLayout
+    private lateinit var bottomPanel: LinearLayout
     private lateinit var expandTopBtn: Button
     private lateinit var previewView: PreviewView
     private lateinit var overlayView: ReticleOverlayView
@@ -114,6 +118,8 @@ class MainActivity : AppCompatActivity() {
 
     // Отдельная полноэкранная страница списка
     private lateinit var listPage: LinearLayout
+    private lateinit var listHeader: LinearLayout
+    private lateinit var listFooter: LinearLayout
     private lateinit var listPageTitle: TextView
     private lateinit var listSearchInput: EditText
     private lateinit var fullListContainer: LinearLayout
@@ -122,6 +128,8 @@ class MainActivity : AppCompatActivity() {
 
     // Отдельная полноэкранная страница настроек API
     private lateinit var apiPage: LinearLayout
+    private lateinit var apiHeader: LinearLayout
+    private lateinit var apiFooter: LinearLayout
     private lateinit var workerUrlInput: EditText
     private lateinit var apiModeSpinner: Spinner
     private lateinit var apiTokenInput: EditText
@@ -133,6 +141,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var scanner: BarcodeScanner
     private var toneGen: ToneGenerator? = null
 
+    private var topInsetPx = 0
     private var thresholdMillis: Long = 0L
     private var dpmMode = true
     private var zoomLevel = 1.0f
@@ -178,7 +187,6 @@ class MainActivity : AppCompatActivity() {
         loadSession()
         updateStatsUi()
 
-        // Системная кнопка «Назад» закрывает открытый список или настройки вместо выхода из приложения
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 when {
@@ -207,13 +215,12 @@ class MainActivity : AppCompatActivity() {
         toneGen?.release()
     }
 
-    // --- Построение всего интерфейса ---
+    // --- Построение всего интерфейса с учётом системных вырезов и статус-бара ---
     private fun buildUi() {
         val rootFrame = FrameLayout(this).apply {
             setBackgroundColor(Color.parseColor("#0F1115"))
         }
 
-        // 1. Основной экран сканера
         val mainScreen = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor("#0F1115"))
@@ -222,25 +229,22 @@ class MainActivity : AppCompatActivity() {
         topBar = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor("#181B22"))
-            setPadding(dp(10), dp(8), dp(10), dp(8))
+            setPadding(dp(8), dp(8), dp(8), dp(6))
         }
 
+        // Первая строка верхнего меню (компактная, чтобы все кнопки помещались на любом экране)
         val row1 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
 
-        val lbl = TextView(this).apply {
-            text = "До: "
-            setTextColor(Color.parseColor("#9CA3AF"))
-            textSize = 12f
-        }
-
-        thresholdBtn = makeChipButton("", "#0F1115", "#F3F4F6").apply {
+        thresholdBtn = makeChipButton("", "#0F1115", "#F3F4F6", padH = 6).apply {
+            setSingleLine(true)
             setOnClickListener { openDatePicker() }
         }
 
-        dpmBtn = makeChipButton("🔬 Крышки", "#06B6D4", "#000000").apply {
+        dpmBtn = makeChipButton("🔬 Банки", "#06B6D4", "#000000", padH = 6).apply {
+            setSingleLine(true)
             setOnClickListener {
                 dpmMode = !dpmMode
                 styleChip(this, if (dpmMode) "#06B6D4" else "#232834", if (dpmMode) "#000000" else "#F3F4F6")
@@ -249,7 +253,8 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        zoomBtn = makeChipButton("🔍 1x", "#232834", "#F3F4F6").apply {
+        zoomBtn = makeChipButton("🔍 1x", "#232834", "#F3F4F6", padH = 6).apply {
+            setSingleLine(true)
             setOnClickListener {
                 zoomLevel = when (zoomLevel) {
                     1.0f -> 2.0f
@@ -262,7 +267,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        torchBtn = makeChipButton("🔦", "#232834", "#F3F4F6").apply {
+        torchBtn = makeChipButton("🔦", "#232834", "#F3F4F6", padH = 7).apply {
             setOnClickListener {
                 val hasFlash = camera?.cameraInfo?.hasFlashUnit() == true
                 if (!hasFlash) {
@@ -275,38 +280,41 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        muteBtn = makeChipButton("🔊", "#232834", "#F3F4F6").apply {
+        muteBtn = makeChipButton("🔊", "#232834", "#F3F4F6", padH = 7).apply {
             setOnClickListener {
                 muted = !muted
                 text = if (muted) "🔇" else "🔊"
             }
         }
 
-        val collapseTopBtn = makeChipButton("▲", "#232834", "#F3F4F6").apply {
+        val collapseTopBtn = makeChipButton("▲", "#232834", "#F3F4F6", padH = 7).apply {
             setOnClickListener {
                 topBar.visibility = View.GONE
                 expandTopBtn.visibility = View.VISIBLE
+                updateFloatingBadgesMargins()
             }
         }
 
-        row1.addView(lbl)
-        row1.addView(thresholdBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(4) })
+        row1.addView(thresholdBtn, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(4) })
         row1.addView(dpmBtn, marginEnd(4))
         row1.addView(zoomBtn, marginEnd(4))
         row1.addView(torchBtn, marginEnd(4))
         row1.addView(muteBtn, marginEnd(4))
         row1.addView(collapseTopBtn)
 
-        // Вторая строка верхнего меню
+        // Вторая строка в горизонтальном скролле, чтобы «Сброс» никогда не обрезался
+        val row2Scroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            setPadding(0, dp(6), 0, 0)
+        }
         val row2 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(6), 0, 0)
         }
 
         val presets = listOf("Сегодня" to 0, "+1 дн" to 1, "+7 дн" to 7, "+14 дн" to 14)
         for ((title, days) in presets) {
-            val btn = makeChipButton(title, if (days == 0) "#3B82F6" else "#232834", "#FFFFFF").apply {
+            val btn = makeChipButton(title, if (days == 0) "#3B82F6" else "#232834", "#FFFFFF", padH = 7).apply {
                 tag = days
                 setOnClickListener {
                     setThresholdOffset(days)
@@ -317,18 +325,16 @@ class MainActivity : AppCompatActivity() {
             row2.addView(btn, marginEnd(4))
         }
 
-        row2.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
-
-        val simBtn = makeChipButton("Тест", "#232834", "#F3F4F6").apply {
+        val simBtn = makeChipButton("Тест", "#232834", "#F3F4F6", padH = 7).apply {
             setOnClickListener { runTestSimulation() }
         }
-        val listBtn = makeChipButton("📋 Список", "#232834", "#F3F4F6").apply {
+        val listBtn = makeChipButton("📋 Список", "#232834", "#F3F4F6", padH = 7).apply {
             setOnClickListener { openListPage("all") }
         }
-        apiBtn = makeChipButton("⚙️ API", "#232834", "#F3F4F6").apply {
+        apiBtn = makeChipButton("⚙️ API", "#232834", "#F3F4F6", padH = 7).apply {
             setOnClickListener { openApiPage() }
         }
-        val resetBtn = makeChipButton("Сброс", "#232834", "#F3F4F6").apply {
+        val resetBtn = makeChipButton("Сброс", "#232834", "#F3F4F6", padH = 7).apply {
             setOnClickListener { confirmReset() }
         }
 
@@ -336,9 +342,10 @@ class MainActivity : AppCompatActivity() {
         row2.addView(listBtn, marginEnd(4))
         row2.addView(apiBtn, marginEnd(4))
         row2.addView(resetBtn)
+        row2Scroll.addView(row2)
 
         topBar.addView(row1)
-        topBar.addView(row2)
+        topBar.addView(row2Scroll)
         mainScreen.addView(topBar)
 
         // Видоискатель камеры
@@ -355,6 +362,7 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener {
                 topBar.visibility = View.VISIBLE
                 visibility = View.GONE
+                updateFloatingBadgesMargins()
             }
         }
 
@@ -382,7 +390,7 @@ class MainActivity : AppCompatActivity() {
         mainScreen.addView(viewport, LinearLayout.LayoutParams(-1, 0, 1f))
 
         // Нижняя панель статистики и просрочки
-        val bottomPanel = LinearLayout(this).apply {
+        bottomPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor("#181B22"))
             setPadding(dp(10), dp(8), dp(10), dp(8))
@@ -429,7 +437,7 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
         }
         logScroll.addView(badLogContainer)
-        bottomPanel.addView(logScroll, LinearLayout.LayoutParams(-1, dp(88)).apply { topMargin = dp(6) })
+        bottomPanel.addView(logScroll, LinearLayout.LayoutParams(-1, dp(84)).apply { topMargin = dp(6) })
 
         mainScreen.addView(bottomPanel)
         rootFrame.addView(mainScreen, FrameLayout.LayoutParams(-1, -1))
@@ -442,7 +450,35 @@ class MainActivity : AppCompatActivity() {
         apiPage = buildFullApiPage()
         rootFrame.addView(apiPage, FrameLayout.LayoutParams(-1, -1))
 
+        // Слушатель системных вырезов (статус-бар сверху, панель навигации снизу)
+        ViewCompat.setOnApplyWindowInsetsListener(rootFrame) { _, windowInsets ->
+            val insets = windowInsets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
+            )
+            topInsetPx = insets.top
+            topBar.setPadding(dp(8), insets.top + dp(6), dp(8), dp(6))
+            bottomPanel.setPadding(dp(10), dp(8), dp(10), insets.bottom + dp(8))
+            listHeader.setPadding(dp(12), insets.top + dp(10), dp(12), dp(10))
+            listFooter.setPadding(dp(12), dp(10), dp(12), insets.bottom + dp(10))
+            apiHeader.setPadding(dp(12), insets.top + dp(10), dp(12), dp(10))
+            apiFooter.setPadding(dp(12), dp(10), dp(12), insets.bottom + dp(10))
+            updateFloatingBadgesMargins()
+            windowInsets
+        }
+
         setContentView(rootFrame)
+    }
+
+    private fun updateFloatingBadgesMargins() {
+        val topOffset = if (topBar.visibility == View.GONE) topInsetPx + dp(10) else dp(10)
+        (expandTopBtn.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
+            lp.topMargin = topOffset
+            expandTopBtn.layoutParams = lp
+        }
+        (queueBadge.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
+            lp.topMargin = topOffset
+            queueBadge.layoutParams = lp
+        }
     }
 
     // --- Отдельная страница списка отсканированного ---
@@ -455,8 +491,7 @@ class MainActivity : AppCompatActivity() {
             isFocusable = true
         }
 
-        // Шапка страницы списка
-        val header = LinearLayout(this).apply {
+        listHeader = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setBackgroundColor(Color.parseColor("#181B22"))
@@ -477,17 +512,19 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { confirmReset() }
         }
 
-        header.addView(backBtn)
-        header.addView(listPageTitle, LinearLayout.LayoutParams(0, -2, 1f))
-        header.addView(clearBtn)
-        page.addView(header)
+        listHeader.addView(backBtn)
+        listHeader.addView(listPageTitle, LinearLayout.LayoutParams(0, -2, 1f))
+        listHeader.addView(clearBtn)
+        page.addView(listHeader)
 
-        // Вкладки фильтра и строка поиска
         val controls = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(10), dp(12), dp(6))
         }
 
+        val tabsScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+        }
         val tabsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
         }
@@ -504,6 +541,7 @@ class MainActivity : AppCompatActivity() {
             listTabButtons.add(b)
             tabsRow.addView(b, marginEnd(6))
         }
+        tabsScroll.addView(tabsRow)
 
         listSearchInput = EditText(this).apply {
             hint = "Поиск по названию, GTIN или серийнику..."
@@ -519,11 +557,10 @@ class MainActivity : AppCompatActivity() {
             })
         }
 
-        controls.addView(tabsRow)
+        controls.addView(tabsScroll)
         controls.addView(listSearchInput, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
         page.addView(controls)
 
-        // Прокручиваемый список карточек
         val scroll = ScrollView(this).apply {
             setPadding(dp(12), dp(4), dp(12), dp(8))
         }
@@ -533,8 +570,7 @@ class MainActivity : AppCompatActivity() {
         scroll.addView(fullListContainer)
         page.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
 
-        // Нижняя панель экспорта CSV
-        val footer = LinearLayout(this).apply {
+        listFooter = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(Color.parseColor("#181B22"))
             setPadding(dp(12), dp(10), dp(12), dp(10))
@@ -551,9 +587,9 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { shareCsv(onlyBad = false) }
         }
 
-        footer.addView(exportBadBtn, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(8) })
-        footer.addView(exportAllBtn)
-        page.addView(footer)
+        listFooter.addView(exportBadBtn, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(8) })
+        listFooter.addView(exportAllBtn)
+        page.addView(listFooter)
 
         return page
     }
@@ -685,7 +721,7 @@ class MainActivity : AppCompatActivity() {
             isFocusable = true
         }
 
-        val header = LinearLayout(this).apply {
+        apiHeader = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setBackgroundColor(Color.parseColor("#181B22"))
@@ -702,10 +738,10 @@ class MainActivity : AppCompatActivity() {
             setTypeface(null, Typeface.BOLD)
             gravity = Gravity.CENTER
         }
-        header.addView(backBtn)
-        header.addView(titleTv, LinearLayout.LayoutParams(0, -2, 1f))
-        header.addView(View(this), LinearLayout.LayoutParams(dp(64), 1))
-        page.addView(header)
+        apiHeader.addView(backBtn)
+        apiHeader.addView(titleTv, LinearLayout.LayoutParams(0, -2, 1f))
+        apiHeader.addView(View(this), LinearLayout.LayoutParams(dp(64), 1))
+        page.addView(apiHeader)
 
         val body = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -755,7 +791,7 @@ class MainActivity : AppCompatActivity() {
         body.addView(apiTokenInput)
         page.addView(body, LinearLayout.LayoutParams(-1, 0, 1f))
 
-        val footer = LinearLayout(this).apply {
+        apiFooter = LinearLayout(this).apply {
             setBackgroundColor(Color.parseColor("#181B22"))
             setPadding(dp(12), dp(10), dp(12), dp(10))
         }
@@ -778,8 +814,8 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this@MainActivity, "Настройки сохранены", Toast.LENGTH_SHORT).show()
             }
         }
-        footer.addView(saveBtn, LinearLayout.LayoutParams(-1, -2))
-        page.addView(footer)
+        apiFooter.addView(saveBtn, LinearLayout.LayoutParams(-1, -2))
+        page.addView(apiFooter)
 
         return page
     }
@@ -815,11 +851,8 @@ class MainActivity : AppCompatActivity() {
     private fun runTestSimulation() {
         val stamp = System.currentTimeMillis()
         val samples = listOf(
-            // 1. Код без тега 17 (уйдёт в Cloudflare Worker)
             "010460068253201921SN_TEST_${stamp}_$simIndex\u001D93ABCD",
-            // 2. Просроченный код с тегом 17
             "010460700123456721SN_EXP_${stamp}_$simIndex\u001D17250115\u001D93WXYZ",
-            // 3. Свежий код с тегом 17
             "010460700987654321SN_OK_${stamp}_$simIndex\u001D17281231\u001D93QWER"
         )
         val code = samples[simIndex % samples.size]
@@ -1311,7 +1344,7 @@ class MainActivity : AppCompatActivity() {
     // --- Даты и пресеты ---
     private fun syncThresholdLabels() {
         val d = Date(thresholdMillis)
-        thresholdBtn.text = dateRuFormat.format(d)
+        thresholdBtn.text = "До ${dateShortFormat.format(d)}"
         expandTopBtn.text = "▼ Меню • до ${dateShortFormat.format(d)}"
     }
 
@@ -1493,7 +1526,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun makeChipButton(label: String, bgHex: String, textHex: String): Button {
+    private fun makeChipButton(label: String, bgHex: String, textHex: String, padH: Int = 8): Button {
         return Button(this).apply {
             text = label
             textSize = 11f
@@ -1502,7 +1535,7 @@ class MainActivity : AppCompatActivity() {
             minimumHeight = 0
             minWidth = 0
             minimumWidth = 0
-            setPadding(dp(8), dp(6), dp(8), dp(6))
+            setPadding(dp(padH), dp(6), dp(padH), dp(6))
             styleChip(this, bgHex, textHex)
         }
     }
