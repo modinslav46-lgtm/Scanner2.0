@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Тёмный фон с закруглёнными углами -->
+    <path
+        android:fillColor="#0F1115"
+        android:pathData="M24,6 H84 A18,18 0 0 1 102,24 V84 A18,18 0 0 1 84,102 H24 A18,18 0 0 1 6,84 V24 A18,18 0 0 1 24,6 Z" />
+
+    <!-- Тонкая рамка -->
+    <path
+        android:strokeColor="#2A2F3D"
+        android:strokeWidth="2"
+        android:pathData="M24,7 H84 A17,17 0 0 1 101,24 V84 A17,17 0 0 1 84,101 H24 A17,17 0 0 1 7,84 V24 A17,17 0 0 1 24,7 Z" />
+
+    <!-- Уголки прицела -->
+    <path
+        android:strokeColor="#06B6D4"
+        android:strokeWidth="4"
+        android:strokeLineCap="round"
+        android:pathData="M22,34 V22 H34 M74,22 H86 V34 M86,74 V86 H74 M34,86 H22 V74" />
+
+    <!-- Г-образная опорная линия DataMatrix -->
+    <path
+        android:fillColor="#F3F4F6"
+        android:pathData="M34,34 H40 V68 H74 V74 H34 Z" />
+
+    <!-- Ячейки DataMatrix -->
+    <path
+        android:fillColor="#F3F4F6"
+        android:pathData="M46,34 H52 V40 H46 Z M58,34 H64 V40 H58 Z M68,34 H74 V40 H68 Z M46,46 H52 V52 H46 Z M62,46 H68 V52 H62 Z M52,58 H58 V64 H52 Z M68,56 H74 V64 H68 Z" />
+
+    <!-- Красный лазерный луч сканера -->
+    <path
+        android:fillColor="#EF4444"
+        android:pathData="M18,52 H90 V56 H18 Z" />
+</vector>
