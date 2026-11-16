@@ -411,7 +411,7 @@ class SwipeHostFrameLayout(context: Context) : FrameLayout(context) {
 class MainActivity : ComponentActivity() {
 
     companion object {
-        const val APP_VERSION = "3.1.1"
+        const val APP_VERSION = "3.1.2"
     }
 
     private lateinit var storage: AppStorage
@@ -630,11 +630,27 @@ class MainActivity : ComponentActivity() {
         ViewCompat.requestApplyInsets(rootFrame)
     }
 
+    // FIX: список теперь корректно позиционируется (в режиме ТСД — под шапкой)
     private fun applySystemInsets() {
         headerContainer.setPadding(dp(8), sysTopInset + dp(8), dp(8), dp(8))
         bottomHud.setPadding(dp(10), dp(10), dp(10), sysBottomInset + dp(12))
-        listSection.setPadding(dp(10), sysTopInset + dp(6), dp(10), sysBottomInset + dp(10))
+        updateListSectionLayout()
         drawerContentCol?.setPadding(dp(16), sysTopInset + dp(18), dp(16), sysBottomInset + dp(24))
+    }
+
+    // FIX: новая функция. В ТСД шапка остаётся видимой, поэтому список сдвигается под неё.
+    private fun updateListSectionLayout() {
+        if (!::listSection.isInitialized || !::headerContainer.isInitialized) return
+        val tsd = storage.tsdMode
+        val topPad = if (tsd) dp(6) else sysTopInset + dp(6)
+        listSection.setPadding(dp(10), topPad, dp(10), sysBottomInset + dp(10))
+
+        val lp = listSection.layoutParams as FrameLayout.LayoutParams
+        val newTop = if (tsd) headerContainer.height else 0
+        if (lp.topMargin != newTop) {
+            lp.topMargin = newTop
+            listSection.layoutParams = lp
+        }
     }
 
     private fun updateSystemBarIconsColor() {
@@ -760,6 +776,8 @@ class MainActivity : ComponentActivity() {
                 if (listSection.visibility != View.VISIBLE) {
                     listSection.visibility = View.VISIBLE
                 }
+                // FIX: панель всегда полностью непрозрачна
+                listSection.alpha = 1f
                 listSection.translationX = w * (1f - progress)
             }
             onRightPanelDragRelease = { vx, progress ->
@@ -875,6 +893,12 @@ class MainActivity : ComponentActivity() {
             presetsRow.addView(tv)
         }
         headerContainer.addView(presetsRow)
+
+        // FIX: при изменении высоты шапки пересчитываем положение списка (нужно для режима ТСД)
+        headerContainer.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            updateListSectionLayout()
+        }
+
         mainColumn.addView(headerContainer)
 
         // ===== 2. КАРТОЧКА ТЕКУЩЕГО / ПОСЛЕДНЕГО СКАНА =====
@@ -1053,12 +1077,14 @@ class MainActivity : ComponentActivity() {
 
         containerMain.addView(mainColumn)
 
-        // ===== 4. ПРАВАЯ ПАНЕЛЬ: ЭКРАН СПИСКА / ТСД (СТРОГО ПОВЕРХ КАМЕРЫ ДЛЯ СВАЙПОВ) =====
+        // ===== 4. ПРАВАЯ ПАНЕЛЬ: ЭКРАН СПИСКА / ТСД =====
         listSection = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(10), sysTopInset + dp(6), dp(10), dp(10))
             layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
             visibility = View.GONE
+            // FIX: панель перехватывает тапы и не пропускает их на камеру/шапку под ней
+            isClickable = true
         }
 
         phoneListTopBar = LinearLayout(this).apply {
@@ -1285,6 +1311,7 @@ class MainActivity : ComponentActivity() {
             layoutParams = FrameLayout.LayoutParams(dp(305), ViewGroup.LayoutParams.MATCH_PARENT, Gravity.START)
             visibility = View.GONE
             translationX = -dp(305).toFloat()
+            isClickable = true
         }
         buildDrawerContent()
         rootFrame.addView(drawerPanel)
@@ -1292,20 +1319,22 @@ class MainActivity : ComponentActivity() {
         setContentView(rootFrame)
     }
 
+    // FIX: без изменения alpha — панель всегда непрозрачна
     private fun openRightPanel() {
         showListScreen = true
-        val w = resources.displayMetrics.widthPixels.toFloat()
         listSection.visibility = View.VISIBLE
         listSection.animate().cancel()
-        listSection.animate().translationX(0f).alpha(1f).setDuration(220L).start()
+        listSection.alpha = 1f
+        listSection.animate().translationX(0f).setDuration(220L).start()
         refreshAllUi()
     }
 
+    // FIX: без изменения alpha, анимация закрытия больше не обрывается из refreshAllUi()
     private fun closeRightPanel() {
         showListScreen = false
         val w = resources.displayMetrics.widthPixels.toFloat()
         listSection.animate().cancel()
-        listSection.animate().translationX(w).alpha(0.8f).setDuration(200L).withEndAction {
+        listSection.animate().translationX(w).setDuration(200L).withEndAction {
             if (!showListScreen) {
                 listSection.visibility = View.GONE
                 // Сброс поиска при возврате к камере
@@ -1352,11 +1381,16 @@ class MainActivity : ComponentActivity() {
                 torchEnabled = false
                 showListScreen = false
                 cameraProvider?.unbindAll()
+                listSection.animate().cancel()
                 listSection.translationX = 0f
                 listSection.alpha = 1f
                 listSection.visibility = View.VISIBLE
                 focusTsdCaptureField()
             } else {
+                // FIX: уводим панель за экран, чтобы она не оставалась поверх камеры
+                listSection.animate().cancel()
+                listSection.translationX = resources.displayMetrics.widthPixels.toFloat()
+                listSection.alpha = 1f
                 listSection.visibility = View.GONE
                 ensureCameraStarted()
             }
@@ -1774,6 +1808,8 @@ class MainActivity : ComponentActivity() {
 
         rootFrame.setBackgroundColor(p.bg)
         headerContainer.setBackgroundColor(p.surface)
+        // FIX: непрозрачный фон правой панели — шапка и камера больше не просвечивают
+        listSection.setBackgroundColor(p.bg)
 
         btnMenu.setTextColor(p.textPrimary)
 
@@ -1816,6 +1852,9 @@ class MainActivity : ComponentActivity() {
             tv.setTextColor(if (active) Color.WHITE else p.textPrimary)
         }
 
+        bottomHud.setBackgroundColor(Color.argb(235, Color.red(p.bg), Color.green(p.bg), Color.blue(p.bg)))
+
+        // FIX: переписанные ветки режимов
         if (tsd) {
             cameraSection.visibility = View.GONE
             phoneListTopBar.visibility = View.GONE
@@ -1828,22 +1867,20 @@ class MainActivity : ComponentActivity() {
             attachBannerCardTo(bannerSlotTsd)
             listSection.visibility = View.VISIBLE
             listSection.translationX = 0f
+            listSection.alpha = 1f
             focusTsdCaptureField()
-        } else if (showListScreen) {
-            cameraSection.visibility = View.GONE
-            phoneListTopBar.visibility = View.VISIBLE
+        } else {
+            // Камера остаётся под панелью (чтобы при анимации не было "дыры"),
+            // а саму панель показывают/скрывают только анимации open/closeRightPanel
+            cameraSection.visibility = View.VISIBLE
             tsdInputContainer.visibility = View.GONE
             bannerSlotTsd.visibility = View.GONE
+            attachBannerCardTo(bannerSlotCamera)
+
+            phoneListTopBar.visibility = View.VISIBLE
             tvPhoneListTitle.text = "Отсканировано: ${items.size}"
             tvPhoneListTitle.textSize = spSize(15f)
             tvPhoneListTitle.setTextColor(p.textPrimary)
-            listSection.visibility = View.VISIBLE
-        } else {
-            cameraSection.visibility = View.VISIBLE
-            tsdInputContainer.visibility = View.GONE
-            bottomHud.setBackgroundColor(Color.argb(235, Color.red(p.bg), Color.green(p.bg), Color.blue(p.bg)))
-            attachBannerCardTo(bannerSlotCamera)
-            listSection.visibility = View.GONE
         }
 
         val expiredCount = items.count { isItemExpired(it) }
@@ -2491,6 +2528,10 @@ class MainActivity : ComponentActivity() {
             Хронология ветки v3.1 (AOR Systems™)
 
             • v$APP_VERSION:
+              - Исправлено наложение интерфейсов при открытии правой панели списка (непрозрачный фон, корректные слои, перехват тапов).
+              - В режиме ТСД список позиций располагается под шапкой без перекрытия.
+
+            • v3.1.1:
               - Обработана аппаратная кнопка «Назад» (закрывает шторки и списки, сбрасывает фокусы поиска).
               - Перепроверены JSON-ключи шлюза ЧЗ — Дата производства теперь определяется и выводится под названием.
               - Правый список позиций теперь плавно выезжает справа и поддерживает жесты (свайп от правого края).
