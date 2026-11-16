@@ -1,1614 +1,2241 @@
 package com.revizor.scanner
 
 import android.Manifest
-import android.app.AlertDialog
-import android.app.DatePickerDialog
+import android.annotation.SuppressLint
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.DashPathEffect
-import android.graphics.Paint
-import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
 import android.media.AudioManager
 import android.media.ToneGenerator
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.os.VibrationEffect
 import android.os.Vibrator
-import android.text.Editable
-import android.text.InputType
-import android.text.TextWatcher
+import android.os.VibratorManager
 import android.util.Size
-import android.view.Gravity
-import android.view.View
-import android.view.ViewGroup
-import android.view.WindowManager
-import android.widget.ArrayAdapter
-import android.widget.Button
-import android.widget.EditText
-import android.widget.FrameLayout
-import android.widget.HorizontalScrollView
-import android.widget.LinearLayout
-import android.widget.ScrollView
-import android.widget.Spinner
-import android.widget.TextView
+import android.view.KeyEvent
 import android.widget.Toast
-import androidx.activity.OnBackPressedCallback
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
-import androidx.camera.core.resolutionselector.ResolutionSelector
-import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import androidx.core.view.ViewCompat
-import androidx.core.view.WindowInsetsCompat
-import com.google.mlkit.vision.barcode.BarcodeScanner
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
+import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
-import java.text.SimpleDateFormat
-import java.util.Calendar
-import java.util.Date
+import java.nio.charset.StandardCharsets
+import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+import java.time.temporal.ChronoUnit
 import java.util.Locale
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import kotlin.random.Random
 
-class MainActivity : AppCompatActivity() {
+// ==================== МОДЕЛИ ДАННЫХ ====================
 
-    data class ScanRecord(
-        val uniqueKey: String,
-        val raw: String,
-        val gtin: String?,
-        val serial: String?,
-        val cis: String,
-        var status: String, // "ok" | "bad" | "nodate" | "pending"
-        var expMillis: Long?,
-        var name: String?,
-        var apiStatus: String?,
-        var error: String?,
-        val scannedAt: Long
-    )
+data class ScannedItem(
+    val uniqueKey: String,
+    val gtin: String,
+    val sn: String,
+    val raw: String,
+    val name: String? = null,
+    val expDate: String? = null, // YYYY-MM-DD
+    val status: String? = null,
+    val infoMsg: String? = null,
+    val isLoading: Boolean = true,
+    val isManual: Boolean = false,
+    val scannedAt: Long = System.currentTimeMillis()
+)
 
-    private val items = ConcurrentHashMap<String, ScanRecord>()
-    private val apiQueue = mutableListOf<ScanRecord>()
-    private val queueLock = Any()
+data class ParsedDataMatrix(
+    val uniqueKey: String,
+    val gtin: String,
+    val sn: String,
+    val cis: String,
+    val raw: String
+)
 
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private val cameraExecutor = Executors.newSingleThreadExecutor()
-    private val networkExecutor = Executors.newSingleThreadExecutor()
+enum class FilterTab(val title: String) {
+    ALL("Все"),
+    EXPIRED("Просрочка"),
+    VALID("Годные"),
+    NO_DATE("Без даты")
+}
 
-    // Главный экран камеры
-    private lateinit var topBar: LinearLayout
-    private lateinit var bottomPanel: LinearLayout
-    private lateinit var expandTopBtn: Button
-    private lateinit var previewView: PreviewView
-    private lateinit var overlayView: ReticleOverlayView
-    private lateinit var thresholdBtn: Button
-    private lateinit var dpmBtn: Button
-    private lateinit var zoomBtn: Button
-    private lateinit var torchBtn: Button
-    private lateinit var muteBtn: Button
-    private lateinit var apiBtn: Button
-    private lateinit var queueBadge: TextView
+enum class FlashType {
+    NONE, VALID, EXPIRED
+}
 
-    private lateinit var statTotalVal: TextView
-    private lateinit var statBadVal: TextView
-    private lateinit var statPendingVal: TextView
-    private lateinit var lastScanCard: LinearLayout
-    private lateinit var lastScanTitle: TextView
-    private lateinit var lastScanSub: TextView
-    private lateinit var badLogContainer: LinearLayout
+// ==================== ПАРСЕР ЧЕСТНОГО ЗНАКА ====================
 
-    // Отдельная полноэкранная страница списка
-    private lateinit var listPage: LinearLayout
-    private lateinit var listHeader: LinearLayout
-    private lateinit var listFooter: LinearLayout
-    private lateinit var listPageTitle: TextView
-    private lateinit var listSearchInput: EditText
-    private lateinit var fullListContainer: LinearLayout
-    private val listTabButtons = mutableListOf<Button>()
-    private var currentListFilter = "all"
+object CrptParser {
+    private const val GS = '\u001D'
 
-    // Отдельная полноэкранная страница настроек API
-    private lateinit var apiPage: LinearLayout
-    private lateinit var apiHeader: LinearLayout
-    private lateinit var apiFooter: LinearLayout
-    private lateinit var workerUrlInput: EditText
-    private lateinit var apiModeSpinner: Spinner
-    private lateinit var apiTokenInput: EditText
-    private val apiModes = arrayOf("mobile_api", "true_api", "mock")
+    fun parse(rawInput: String): ParsedDataMatrix? {
+        val cleaned = rawInput
+            .replace("\r", "")
+            .replace("\n", "")
+            .replace("<GS>", GS.toString())
+            .replace("\\u001d", GS.toString(), ignoreCase = true)
+            .trim()
 
-    private val pillButtons = mutableListOf<Button>()
+        if (cleaned.length < 18) return null
 
-    private var camera: Camera? = null
-    private lateinit var scanner: BarcodeScanner
-    private var toneGen: ToneGenerator? = null
+        // Ищем AI 01 (14 цифр GTIN) + AI 21 (серийный номер)
+        val startIdx = if (cleaned.startsWith("01")) 0 else cleaned.indexOf("01")
+        if (startIdx == -1 || cleaned.length < startIdx + 18) return null
 
-    private var topInsetPx = 0
-    private var thresholdMillis: Long = 0L
-    private var dpmMode = true
-    private var zoomLevel = 1.0f
-    private var torchOn = false
-    private var muted = false
-    private var frameIndex = 0
-    private var simIndex = 0
-    private var inFlightCount = 0
-    private var flushScheduled = false
+        val gtin = cleaned.substring(startIdx + 2, startIdx + 16)
+        if (!gtin.all { it.isDigit() }) return null
 
-    private var workerUrl = ""
-    private var apiMode = "mobile_api"
-    private var apiToken = ""
+        val afterGtin = cleaned.substring(startIdx + 16)
+        if (!afterGtin.startsWith("21")) return null
 
-    private val dateRuFormat = SimpleDateFormat("dd.MM.yyyy", Locale("ru"))
-    private val dateShortFormat = SimpleDateFormat("dd.MM", Locale("ru"))
-    private val dateIsoFormat = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+        val snPart = afterGtin.substring(2)
+        val gsIdx = snPart.indexOf(GS)
+        val sn = if (gsIdx != -1) {
+            snPart.substring(0, gsIdx)
+        } else {
+            // Если сканер обрезал GS, отсекаем известные крипто-хвосты 91/92/93
+            val tailMatch = Regex("(91[0-9A-Za-z]{4}|92[0-9A-Za-z]{10,}|93[0-9A-Za-z]{4})").find(snPart)
+            if (tailMatch != null && tailMatch.range.first >= 4) {
+                snPart.substring(0, tailMatch.range.first)
+            } else {
+                snPart.take(20)
+            }
+        }
 
-    private val requestCameraPermission = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) startCamera()
-        else Toast.makeText(this, "Нужен доступ к камере для сканирования", Toast.LENGTH_LONG).show()
+        if (sn.isBlank()) return null
+
+        return ParsedDataMatrix(
+            uniqueKey = "$gtin|$sn",
+            gtin = gtin,
+            sn = sn,
+            cis = "01${gtin}21$sn",
+            raw = cleaned
+        )
     }
+}
+
+// ==================== ХРАНИЛИЩЕ НАСТРОЕК И СМЕНЫ ====================
+
+class AppStorage(context: Context) {
+    private val prefs = context.getSharedPreferences("aor_cz_scanner_v3", Context.MODE_PRIVATE)
+
+    var apiUrl: String
+        get() = prefs.getString("api_url", "https://functions.yandexcloud.net/ВАШ_ID_ФУНКЦИИ") ?: ""
+        set(v) = prefs.edit().putString("api_url", v.trim()).apply()
+
+    var apiMode: String
+        get() = prefs.getString("api_mode", "mobile_api") ?: "mobile_api"
+        set(v) = prefs.edit().putString("api_mode", v).apply()
+
+    var apiToken: String
+        get() = prefs.getString("api_token", "") ?: ""
+        set(v) = prefs.edit().putString("api_token", v.trim()).apply()
+
+    var soundEnabled: Boolean
+        get() = prefs.getBoolean("sound_enabled", true)
+        set(v) = prefs.edit().putBoolean("sound_enabled", v).apply()
+
+    var tsdMode: Boolean
+        get() = prefs.getBoolean("tsd_mode", false)
+        set(v) = prefs.edit().putBoolean("tsd_mode", v).apply()
+
+    var darkTheme: Boolean
+        get() = prefs.getBoolean("dark_theme", true)
+        set(v) = prefs.edit().putBoolean("dark_theme", v).apply()
+
+    var largeFont: Boolean
+        get() = prefs.getBoolean("large_font", false)
+        set(v) = prefs.edit().putBoolean("large_font", v).apply()
+
+    var flashEnabled: Boolean
+        get() = prefs.getBoolean("flash_enabled", true)
+        set(v) = prefs.edit().putBoolean("flash_enabled", v).apply()
+
+    var fifoBarEnabled: Boolean
+        get() = prefs.getBoolean("fifo_bar_enabled", true)
+        set(v) = prefs.edit().putBoolean("fifo_bar_enabled", v).apply()
+
+    var groupByName: Boolean
+        get() = prefs.getBoolean("group_by_name", false)
+        set(v) = prefs.edit().putBoolean("group_by_name", v).apply()
+
+    var offsetDays: Int
+        get() = prefs.getInt("offset_days", 1)
+        set(v) = prefs.edit().putInt("offset_days", v).apply()
+
+    fun saveItems(items: List<ScannedItem>) {
+        val arr = JSONArray()
+        for (it in items) {
+            val obj = JSONObject().apply {
+                put("uniqueKey", it.uniqueKey)
+                put("gtin", it.gtin)
+                put("sn", it.sn)
+                put("raw", it.raw)
+                put("name", it.name ?: JSONObject.NULL)
+                put("expDate", it.expDate ?: JSONObject.NULL)
+                put("status", it.status ?: JSONObject.NULL)
+                put("infoMsg", it.infoMsg ?: JSONObject.NULL)
+                put("isLoading", false) // После перезапуска не зависаем в вечной загрузке
+                put("isManual", it.isManual)
+                put("scannedAt", it.scannedAt)
+            }
+            arr.put(obj)
+        }
+        prefs.edit().putString("saved_items_json", arr.toString()).apply()
+    }
+
+    fun loadItems(): List<ScannedItem> {
+        val raw = prefs.getString("saved_items_json", null) ?: return emptyList()
+        return try {
+            val arr = JSONArray(raw)
+            val list = ArrayList<ScannedItem>(arr.length())
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                list.add(
+                    ScannedItem(
+                        uniqueKey = o.getString("uniqueKey"),
+                        gtin = o.optString("gtin", ""),
+                        sn = o.optString("sn", ""),
+                        raw = o.optString("raw", ""),
+                        name = if (o.isNull("name")) null else o.getString("name"),
+                        expDate = if (o.isNull("expDate")) null else o.getString("expDate"),
+                        status = if (o.isNull("status")) null else o.getString("status"),
+                        infoMsg = if (o.isNull("infoMsg")) null else o.getString("infoMsg"),
+                        isLoading = false,
+                        isManual = o.optBoolean("isManual", false),
+                        scannedAt = o.optLong("scannedAt", System.currentTimeMillis())
+                    )
+                )
+            }
+            list
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+}
+
+// ==================== MAIN ACTIVITY ====================
+
+class MainActivity : ComponentActivity() {
+
+    private val hardwareScanFlow = Channel<String>(Channel.UNLIMITED)
+    private val keyBuffer = StringBuilder()
+    private var lastKeyTime = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        setContent {
+            AorScannerApp(hardwareScanFlow = hardwareScanFlow)
+        }
+    }
 
+    // Перехват аппаратного сканера в режиме эмуляции клавиатуры (HID / Keyboard Wedge)
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN) {
+            val now = System.currentTimeMillis()
+            if (now - lastKeyTime > 250L && keyBuffer.isNotEmpty()) {
+                keyBuffer.clear()
+            }
+            lastKeyTime = now
+
+            if (event.keyCode == KeyEvent.KEYCODE_ENTER || event.keyCode == KeyEvent.KEYCODE_TAB) {
+                if (keyBuffer.length >= 18) {
+                    val code = keyBuffer.toString()
+                    keyBuffer.clear()
+                    hardwareScanFlow.trySend(code)
+                    return true
+                }
+                keyBuffer.clear()
+            } else {
+                val unicode = event.unicodeChar
+                if (unicode > 0) {
+                    keyBuffer.append(unicode.toChar())
+                }
+            }
+        }
+        return super.dispatchKeyEvent(event)
+    }
+}
+
+// ==================== ЦВЕТОВЫЕ СХЕМЫ ====================
+
+private val DarkScheme = darkColorScheme(
+    primary = Color(0xFF3B82F6),
+    onPrimary = Color.White,
+    background = Color(0xFF090B0E),
+    surface = Color(0xFF131720),
+    surfaceVariant = Color(0xFF1C2230),
+    onBackground = Color(0xFFF1F5F9),
+    onSurface = Color(0xFFF1F5F9),
+    onSurfaceVariant = Color(0xFF94A3B8),
+    outline = Color(0xFF2B3446)
+)
+
+private val LightScheme = lightColorScheme(
+    primary = Color(0xFF2563EB),
+    onPrimary = Color.White,
+    background = Color(0xFFF1F5F9),
+    surface = Color(0xFFFFFFFF),
+    surfaceVariant = Color(0xFFE2E8F0),
+    onBackground = Color(0xFF0F172A),
+    onSurface = Color(0xFF0F172A),
+    onSurfaceVariant = Color(0xFF475569),
+    outline = Color(0xFFCBD5E1)
+)
+
+// ==================== ОСНОВНОЙ UI ПРИЛОЖЕНИЯ ====================
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun AorScannerApp(hardwareScanFlow: Channel<String>) {
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    val storage = remember { AppStorage(context) }
+
+    // Персистентные состояния
+    var items by remember { mutableStateOf(storage.loadItems()) }
+    var soundEnabled by remember { mutableStateOf(storage.soundEnabled) }
+    var tsdMode by remember { mutableStateOf(storage.tsdMode) }
+    var darkTheme by remember { mutableStateOf(storage.darkTheme) }
+    var largeFont by remember { mutableStateOf(storage.largeFont) }
+    var flashEnabled by remember { mutableStateOf(storage.flashEnabled) }
+    var fifoBarEnabled by remember { mutableStateOf(storage.fifoBarEnabled) }
+    var groupByName by remember { mutableStateOf(storage.groupByName) }
+    var offsetDays by remember { mutableIntStateOf(storage.offsetDays) }
+
+    var apiUrl by remember { mutableStateOf(storage.apiUrl) }
+    var apiMode by remember { mutableStateOf(storage.apiMode) }
+    var apiToken by remember { mutableStateOf(storage.apiToken) }
+
+    // Оперативные состояния экрана
+    var showListSheet by remember { mutableStateOf(false) }
+    var activeBannerKey by remember { mutableStateOf<String?>(null) }
+    var isDuplicateBanner by remember { mutableStateOf(false) }
+    var flashType by remember { mutableStateOf(FlashType.NONE) }
+    var isShelfLocked by remember { mutableStateOf(false) }
+    var showResetConfirm by remember { mutableStateOf(false) }
+    var showManualAddDialog by remember { mutableStateOf(false) }
+
+    // Состояния камеры
+    var hasCameraPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        )
+    }
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted -> hasCameraPermission = granted }
+
+    var torchEnabled by remember { mutableStateOf(false) }
+    var fullFrameScan by remember { mutableStateOf(false) }
+    var zoomPresetIndex by remember { mutableIntStateOf(1) } // 0 = 0.6x (макро), 1 = 1x, 2 = 2x, 3 = 3x
+
+    // Фильтры списка
+    var selectedTab by remember { mutableStateOf(FilterTab.ALL) }
+    var searchQuery by remember { mutableStateOf("") }
+    var expandedGroups by remember { mutableStateOf(setOf<String>()) }
+
+    val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
+    val scope = rememberCoroutineScope()
+    val apiQueue = remember { Channel<ParsedDataMatrix>(Channel.UNLIMITED) }
+
+    val today = remember { LocalDate.now() }
+    val thresholdDate = remember(today, offsetDays) { today.plusDays(offsetDays.toLong()) }
+
+    // Хелпер проверки просрочки
+    fun isExpired(expIso: String?): Boolean {
+        if (expIso.isNullOrBlank()) return false
+        return try {
+            val d = LocalDate.parse(expIso.take(10))
+            !d.isAfter(thresholdDate) // <= thresholdDate
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    // Сохранение списка при любом изменении
+    fun updateItems(newList: List<ScannedItem>) {
+        items = newList
+        storage.saveItems(newList)
+    }
+
+    // Обратная связь: вибрация + звук + цветовая вспышка
+    val toneGen = remember {
         try {
-            toneGen = ToneGenerator(AudioManager.STREAM_ALARM, 90)
-        } catch (_: Exception) {}
+            ToneGenerator(AudioManager.STREAM_ALARM, 90)
+        } catch (_: Exception) {
+            null
+        }
+    }
+    DisposableEffect(Unit) {
+        onDispose { toneGen?.release() }
+    }
 
-        val options = BarcodeScannerOptions.Builder()
-            .setBarcodeFormats(Barcode.FORMAT_DATA_MATRIX)
-            .build()
-        scanner = BarcodeScanning.getClient(options)
-
-        loadConfig()
-        buildUi()
-        syncApiButtonStyle()
-        setThresholdOffset(0)
-        loadSession()
-        updateStatsUi()
-
-        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
-            override fun handleOnBackPressed() {
-                when {
-                    listPage.visibility == View.VISIBLE -> listPage.visibility = View.GONE
-                    apiPage.visibility == View.VISIBLE -> apiPage.visibility = View.GONE
-                    else -> {
-                        isEnabled = false
-                        onBackPressedDispatcher.onBackPressed()
-                    }
-                }
-            }
-        })
-
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-            startCamera()
+    fun triggerFeedback(expired: Boolean, isDuplicate: Boolean = false) {
+        val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            (context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager)?.defaultVibrator
         } else {
-            requestCameraPermission.launch(Manifest.permission.CAMERA)
-        }
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        cameraExecutor.shutdown()
-        networkExecutor.shutdown()
-        scanner.close()
-        toneGen?.release()
-    }
-
-    // --- Построение всего интерфейса с учётом системных вырезов и статус-бара ---
-    private fun buildUi() {
-        val rootFrame = FrameLayout(this).apply {
-            setBackgroundColor(Color.parseColor("#0F1115"))
+            @Suppress("DEPRECATION")
+            context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
         }
 
-        val mainScreen = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#0F1115"))
-        }
-
-        topBar = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#181B22"))
-            setPadding(dp(8), dp(8), dp(8), dp(6))
-        }
-
-        // Первая строка верхнего меню (компактная, чтобы все кнопки помещались на любом экране)
-        val row1 = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-
-        thresholdBtn = makeChipButton("", "#0F1115", "#F3F4F6", padH = 6).apply {
-            setSingleLine(true)
-            setOnClickListener { openDatePicker() }
-        }
-
-        dpmBtn = makeChipButton("🔬 Банки", "#06B6D4", "#000000", padH = 6).apply {
-            setSingleLine(true)
-            setOnClickListener {
-                dpmMode = !dpmMode
-                styleChip(this, if (dpmMode) "#06B6D4" else "#232834", if (dpmMode) "#000000" else "#F3F4F6")
-                overlayView.showReticle = dpmMode
-                overlayView.invalidate()
-            }
-        }
-
-        zoomBtn = makeChipButton("🔍 1x", "#232834", "#F3F4F6", padH = 6).apply {
-            setSingleLine(true)
-            setOnClickListener {
-                zoomLevel = when (zoomLevel) {
-                    1.0f -> 2.0f
-                    2.0f -> 3.0f
-                    else -> 1.0f
-                }
-                text = "🔍 ${zoomLevel.toInt()}x"
-                styleChip(this, if (zoomLevel > 1f) "#EAB308" else "#232834", if (zoomLevel > 1f) "#000000" else "#F3F4F6")
-                camera?.cameraControl?.setZoomRatio(zoomLevel)
-            }
-        }
-
-        torchBtn = makeChipButton("🔦", "#232834", "#F3F4F6", padH = 7).apply {
-            setOnClickListener {
-                val hasFlash = camera?.cameraInfo?.hasFlashUnit() == true
-                if (!hasFlash) {
-                    Toast.makeText(this@MainActivity, "Вспышка недоступна", Toast.LENGTH_SHORT).show()
-                    return@setOnClickListener
-                }
-                torchOn = !torchOn
-                camera?.cameraControl?.enableTorch(torchOn)
-                styleChip(this, if (torchOn) "#EAB308" else "#232834", if (torchOn) "#000000" else "#F3F4F6")
-            }
-        }
-
-        muteBtn = makeChipButton("🔊", "#232834", "#F3F4F6", padH = 7).apply {
-            setOnClickListener {
-                muted = !muted
-                text = if (muted) "🔇" else "🔊"
-            }
-        }
-
-        val collapseTopBtn = makeChipButton("▲", "#232834", "#F3F4F6", padH = 7).apply {
-            setOnClickListener {
-                topBar.visibility = View.GONE
-                expandTopBtn.visibility = View.VISIBLE
-                updateFloatingBadgesMargins()
-            }
-        }
-
-        row1.addView(thresholdBtn, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(4) })
-        row1.addView(dpmBtn, marginEnd(4))
-        row1.addView(zoomBtn, marginEnd(4))
-        row1.addView(torchBtn, marginEnd(4))
-        row1.addView(muteBtn, marginEnd(4))
-        row1.addView(collapseTopBtn)
-
-        // Вторая строка в горизонтальном скролле, чтобы «Сброс» никогда не обрезался
-        val row2Scroll = HorizontalScrollView(this).apply {
-            isHorizontalScrollBarEnabled = false
-            setPadding(0, dp(6), 0, 0)
-        }
-        val row2 = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-
-        val presets = listOf("Сегодня" to 0, "+1 дн" to 1, "+7 дн" to 7, "+14 дн" to 14)
-        for ((title, days) in presets) {
-            val btn = makeChipButton(title, if (days == 0) "#3B82F6" else "#232834", "#FFFFFF", padH = 7).apply {
-                tag = days
-                setOnClickListener {
-                    setThresholdOffset(days)
-                    highlightPreset(days)
-                }
-            }
-            pillButtons.add(btn)
-            row2.addView(btn, marginEnd(4))
-        }
-
-        val simBtn = makeChipButton("Тест", "#232834", "#F3F4F6", padH = 7).apply {
-            setOnClickListener { runTestSimulation() }
-        }
-        val listBtn = makeChipButton("📋 Список", "#232834", "#F3F4F6", padH = 7).apply {
-            setOnClickListener { openListPage("all") }
-        }
-        apiBtn = makeChipButton("⚙️ API", "#232834", "#F3F4F6", padH = 7).apply {
-            setOnClickListener { openApiPage() }
-        }
-        val resetBtn = makeChipButton("Сброс", "#232834", "#F3F4F6", padH = 7).apply {
-            setOnClickListener { confirmReset() }
-        }
-
-        row2.addView(simBtn, marginEnd(4))
-        row2.addView(listBtn, marginEnd(4))
-        row2.addView(apiBtn, marginEnd(4))
-        row2.addView(resetBtn)
-        row2Scroll.addView(row2)
-
-        topBar.addView(row1)
-        topBar.addView(row2Scroll)
-        mainScreen.addView(topBar)
-
-        // Видоискатель камеры
-        val viewport = FrameLayout(this).apply {
-            setBackgroundColor(Color.BLACK)
-        }
-        previewView = PreviewView(this).apply {
-            scaleType = PreviewView.ScaleType.FILL_CENTER
-        }
-        overlayView = ReticleOverlayView(this)
-
-        expandTopBtn = makeChipButton("▼ Меню", "#E6181B22", "#F3F4F6").apply {
-            visibility = View.GONE
-            setOnClickListener {
-                topBar.visibility = View.VISIBLE
-                visibility = View.GONE
-                updateFloatingBadgesMargins()
-            }
-        }
-
-        queueBadge = TextView(this).apply {
-            text = "⏳ API: 0"
-            setTextColor(Color.parseColor("#06B6D4"))
-            textSize = 12f
-            setTypeface(null, Typeface.BOLD)
-            setPadding(dp(10), dp(4), dp(10), dp(4))
-            background = roundBg("#D90F1115", "#06B6D4", 20)
-            visibility = View.GONE
-        }
-
-        viewport.addView(previewView, FrameLayout.LayoutParams(-1, -1))
-        viewport.addView(overlayView, FrameLayout.LayoutParams(-1, -1))
-        viewport.addView(expandTopBtn, FrameLayout.LayoutParams(-2, -2).apply {
-            gravity = Gravity.TOP or Gravity.START
-            setMargins(dp(10), dp(10), dp(10), dp(10))
-        })
-        viewport.addView(queueBadge, FrameLayout.LayoutParams(-2, -2).apply {
-            gravity = Gravity.TOP or Gravity.END
-            setMargins(dp(10), dp(10), dp(10), dp(10))
-        })
-
-        mainScreen.addView(viewport, LinearLayout.LayoutParams(-1, 0, 1f))
-
-        // Нижняя панель статистики и просрочки
-        bottomPanel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#181B22"))
-            setPadding(dp(10), dp(8), dp(10), dp(8))
-        }
-
-        val statsRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-        }
-
-        val box1 = makeStatBox("Уникальных ↗", "#F3F4F6") { openListPage("all") }
-        statTotalVal = box1.second
-        val box2 = makeStatBox("Просрочка ↗", "#EF4444") { openListPage("bad") }
-        statBadVal = box2.second
-        val box3 = makeStatBox("Без даты / API ↗", "#06B6D4") { openListPage("nodate") }
-        statPendingVal = box3.second
-
-        statsRow.addView(box1.first, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(6) })
-        statsRow.addView(box2.first, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(6) })
-        statsRow.addView(box3.first, LinearLayout.LayoutParams(0, -2, 1f))
-        bottomPanel.addView(statsRow)
-
-        lastScanCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(10), dp(7), dp(10), dp(7))
-            background = roundBg("#11141A", "#2A2F3D", 8)
-        }
-        lastScanTitle = TextView(this).apply {
-            text = "Ожидание сканирования..."
-            setTextColor(Color.parseColor("#9CA3AF"))
-            textSize = 13f
-            setTypeface(null, Typeface.BOLD)
-        }
-        lastScanSub = TextView(this).apply {
-            text = "Наведите камеру на крышку банки или этикетку"
-            setTextColor(Color.parseColor("#9CA3AF"))
-            textSize = 11f
-        }
-        lastScanCard.addView(lastScanTitle)
-        lastScanCard.addView(lastScanSub)
-        bottomPanel.addView(lastScanCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) })
-
-        val logScroll = ScrollView(this)
-        badLogContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
-        logScroll.addView(badLogContainer)
-        bottomPanel.addView(logScroll, LinearLayout.LayoutParams(-1, dp(84)).apply { topMargin = dp(6) })
-
-        mainScreen.addView(bottomPanel)
-        rootFrame.addView(mainScreen, FrameLayout.LayoutParams(-1, -1))
-
-        // 2. Отдельная полноэкранная страница списка
-        listPage = buildFullListPage()
-        rootFrame.addView(listPage, FrameLayout.LayoutParams(-1, -1))
-
-        // 3. Отдельная полноэкранная страница настроек API
-        apiPage = buildFullApiPage()
-        rootFrame.addView(apiPage, FrameLayout.LayoutParams(-1, -1))
-
-        // Слушатель системных вырезов (статус-бар сверху, панель навигации снизу)
-        ViewCompat.setOnApplyWindowInsetsListener(rootFrame) { _, windowInsets ->
-            val insets = windowInsets.getInsets(
-                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
-            )
-            topInsetPx = insets.top
-            topBar.setPadding(dp(8), insets.top + dp(6), dp(8), dp(6))
-            bottomPanel.setPadding(dp(10), dp(8), dp(10), insets.bottom + dp(8))
-            listHeader.setPadding(dp(12), insets.top + dp(10), dp(12), dp(10))
-            listFooter.setPadding(dp(12), dp(10), dp(12), insets.bottom + dp(10))
-            apiHeader.setPadding(dp(12), insets.top + dp(10), dp(12), dp(10))
-            apiFooter.setPadding(dp(12), dp(10), dp(12), insets.bottom + dp(10))
-            updateFloatingBadgesMargins()
-            windowInsets
-        }
-
-        setContentView(rootFrame)
-    }
-
-    private fun updateFloatingBadgesMargins() {
-        val topOffset = if (topBar.visibility == View.GONE) topInsetPx + dp(10) else dp(10)
-        (expandTopBtn.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
-            lp.topMargin = topOffset
-            expandTopBtn.layoutParams = lp
-        }
-        (queueBadge.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
-            lp.topMargin = topOffset
-            queueBadge.layoutParams = lp
-        }
-    }
-
-    // --- Отдельная страница списка отсканированного ---
-    private fun buildFullListPage(): LinearLayout {
-        val page = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#0F1115"))
-            visibility = View.GONE
-            isClickable = true
-            isFocusable = true
-        }
-
-        listHeader = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(Color.parseColor("#181B22"))
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-        }
-
-        val backBtn = makeChipButton("← К камере", "#232834", "#F3F4F6").apply {
-            setOnClickListener { page.visibility = View.GONE }
-        }
-        listPageTitle = TextView(this).apply {
-            text = "Отсканировано: 0"
-            setTextColor(Color.WHITE)
-            textSize = 15f
-            setTypeface(null, Typeface.BOLD)
-            gravity = Gravity.CENTER
-        }
-        val clearBtn = makeChipButton("Очистить", "#232834", "#EF4444").apply {
-            setOnClickListener { confirmReset() }
-        }
-
-        listHeader.addView(backBtn)
-        listHeader.addView(listPageTitle, LinearLayout.LayoutParams(0, -2, 1f))
-        listHeader.addView(clearBtn)
-        page.addView(listHeader)
-
-        val controls = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(10), dp(12), dp(6))
-        }
-
-        val tabsScroll = HorizontalScrollView(this).apply {
-            isHorizontalScrollBarEnabled = false
-        }
-        val tabsRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-        }
-        val tabs = listOf("Все" to "all", "Просрочка" to "bad", "Годные" to "ok", "Без даты" to "nodate")
-        for ((label, key) in tabs) {
-            val b = makeChipButton(label, if (key == "all") "#3B82F6" else "#232834", "#FFFFFF").apply {
-                tag = key
-                setOnClickListener {
-                    currentListFilter = key
-                    syncListTabStyles()
-                    renderFullList()
-                }
-            }
-            listTabButtons.add(b)
-            tabsRow.addView(b, marginEnd(6))
-        }
-        tabsScroll.addView(tabsRow)
-
-        listSearchInput = EditText(this).apply {
-            hint = "Поиск по названию, GTIN или серийнику..."
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.parseColor("#9CA3AF"))
-            textSize = 14f
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            background = roundBg("#181B22", "#2A2F3D", 10)
-            addTextChangedListener(object : TextWatcher {
-                override fun afterTextChanged(s: Editable?) = renderFullList()
-                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
-            })
-        }
-
-        controls.addView(tabsScroll)
-        controls.addView(listSearchInput, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
-        page.addView(controls)
-
-        val scroll = ScrollView(this).apply {
-            setPadding(dp(12), dp(4), dp(12), dp(8))
-        }
-        fullListContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
-        scroll.addView(fullListContainer)
-        page.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
-
-        listFooter = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(Color.parseColor("#181B22"))
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-        }
-
-        val exportBadBtn = makeChipButton("📥 CSV Просрочка", "#EF4444", "#FFFFFF").apply {
-            textSize = 13f
-            setPadding(dp(12), dp(12), dp(12), dp(12))
-            setOnClickListener { shareCsv(onlyBad = true) }
-        }
-        val exportAllBtn = makeChipButton("📥 CSV Всё", "#232834", "#F3F4F6").apply {
-            textSize = 13f
-            setPadding(dp(14), dp(12), dp(14), dp(12))
-            setOnClickListener { shareCsv(onlyBad = false) }
-        }
-
-        listFooter.addView(exportBadBtn, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(8) })
-        listFooter.addView(exportAllBtn)
-        page.addView(listFooter)
-
-        return page
-    }
-
-    private fun openListPage(filter: String) {
-        currentListFilter = filter
-        syncListTabStyles()
-        renderFullList()
-        listPage.visibility = View.VISIBLE
-    }
-
-    private fun syncListTabStyles() {
-        for (tb in listTabButtons) {
-            val active = (tb.tag as String) == currentListFilter
-            styleChip(tb, if (active) "#3B82F6" else "#232834", "#FFFFFF")
-        }
-    }
-
-    private fun renderFullList() {
-        fullListContainer.removeAllViews()
-        listPageTitle.text = "Отсканировано: ${items.size}"
-        val q = listSearchInput.text.toString().trim().lowercase()
-
-        val filtered = items.values
-            .sortedByDescending { it.scannedAt }
-            .filter { rec ->
-                val passTab = when (currentListFilter) {
-                    "bad" -> rec.status == "bad"
-                    "ok" -> rec.status == "ok"
-                    "nodate" -> rec.status == "nodate" || rec.status == "pending"
-                    else -> true
-                }
-                val hay = "${rec.name ?: ""} ${rec.gtin ?: ""} ${rec.serial ?: ""}".lowercase()
-                passTab && (q.isEmpty() || hay.contains(q))
-            }
-
-        if (filtered.isEmpty()) {
-            fullListContainer.addView(TextView(this).apply {
-                text = "Список пуст"
-                setTextColor(Color.parseColor("#9CA3AF"))
-                gravity = Gravity.CENTER
-                setPadding(dp(12), dp(40), dp(12), dp(40))
-            })
+        if (isDuplicate) {
+            vibrator?.vibrate(VibrationEffect.createOneShot(18, 90))
             return
         }
 
-        for (rec in filtered) {
-            val card = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(12), dp(10), dp(12), dp(10))
-                val border = when (rec.status) {
-                    "bad" -> "#EF4444"
-                    "ok" -> "#22C55E"
-                    "pending" -> "#06B6D4"
-                    else -> "#F59E0B"
-                }
-                val fill = if (rec.status == "bad") "#221317" else "#181B22"
-                background = roundBg(fill, border, 10)
+        if (expired) {
+            vibrator?.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 220, 90, 220), -1))
+            if (soundEnabled) {
+                toneGen?.startTone(ToneGenerator.TONE_CDMA_EMERGENCY_RINGBACK, 350)
             }
-
-            val infoCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-            val titleTv = TextView(this).apply {
-                text = rec.name ?: (rec.gtin?.let { "GTIN $it" } ?: rec.raw.take(22))
-                setTextColor(Color.WHITE)
-                textSize = 14f
-                setTypeface(null, Typeface.BOLD)
-            }
-
-            val idDetails = buildString {
-                if (rec.name != null && rec.gtin != null) append("GTIN: ${rec.gtin} • ")
-                append("SN: ${rec.serial ?: "—"}")
-            }
-            val idTv = TextView(this).apply {
-                text = idDetails
-                setTextColor(Color.parseColor("#9CA3AF"))
-                textSize = 11f
-                setPadding(0, dp(2), 0, dp(3))
-            }
-
-            val (statusStr, statusColor) = when (rec.status) {
-                "bad" -> {
-                    val txt = rec.expMillis?.let { "Списать: до ${dateRuFormat.format(Date(it))}" } ?: "Выбыл / Риск"
-                    txt to "#EF4444"
-                }
-                "ok" -> {
-                    val txt = "Годен: до ${rec.expMillis?.let { dateRuFormat.format(Date(it)) } ?: "—"}"
-                    txt to "#22C55E"
-                }
-                "pending" -> "⏳ Запрос срока в ЧЗ..." to "#06B6D4"
-                else -> (rec.error ?: "Без даты (17)") to "#F59E0B"
-            }
-
-            val statusTv = TextView(this).apply {
-                text = statusStr
-                setTextColor(Color.parseColor(statusColor))
-                textSize = 12f
-                setTypeface(null, Typeface.BOLD)
-            }
-
-            infoCol.addView(titleTv)
-            infoCol.addView(idTv)
-            infoCol.addView(statusTv)
-
-            val delBtn = makeChipButton("✕", "#232834", "#9CA3AF").apply {
-                setPadding(dp(10), dp(8), dp(10), dp(8))
-                setOnClickListener {
-                    items.remove(rec.uniqueKey)
-                    saveSession()
-                    updateStatsUi()
-                    rebuildMiniBadLog()
-                    renderFullList()
+            if (flashEnabled) {
+                flashType = FlashType.EXPIRED
+                scope.launch {
+                    delay(480)
+                    flashType = FlashType.NONE
                 }
             }
-
-            card.addView(infoCol, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(8) })
-            card.addView(delBtn)
-            fullListContainer.addView(card, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
-        }
-    }
-
-    // --- Отдельная страница настроек Cloudflare Worker ---
-    private fun buildFullApiPage(): LinearLayout {
-        val page = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#0F1115"))
-            visibility = View.GONE
-            isClickable = true
-            isFocusable = true
-        }
-
-        apiHeader = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(Color.parseColor("#181B22"))
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-        }
-
-        val backBtn = makeChipButton("← Назад", "#232834", "#F3F4F6").apply {
-            setOnClickListener { page.visibility = View.GONE }
-        }
-        val titleTv = TextView(this).apply {
-            text = "Настройка Cloudflare Worker"
-            setTextColor(Color.WHITE)
-            textSize = 15f
-            setTypeface(null, Typeface.BOLD)
-            gravity = Gravity.CENTER
-        }
-        apiHeader.addView(backBtn)
-        apiHeader.addView(titleTv, LinearLayout.LayoutParams(0, -2, 1f))
-        apiHeader.addView(View(this), LinearLayout.LayoutParams(dp(64), 1))
-        page.addView(apiHeader)
-
-        val body = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(14), dp(14), dp(14))
-        }
-
-        val hintTv = TextView(this).apply {
-            text = "Для реальных товаров выберите «Mobile / Шлюз проверки» или «True API ГИС МТ». В режиме Mock воркер возвращает тестовые заглушки."
-            setTextColor(Color.parseColor("#9CA3AF"))
-            textSize = 12f
-            setPadding(0, 0, 0, dp(12))
-        }
-
-        workerUrlInput = EditText(this).apply {
-            hint = "https://chz-proxy.ваш-ник.workers.dev"
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.parseColor("#6B7280"))
-            inputType = InputType.TYPE_TEXT_VARIATION_URI
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            background = roundBg("#181B22", "#2A2F3D", 10)
-        }
-
-        val modeLabels = arrayOf(
-            "Mobile / Шлюз проверки (реальный)",
-            "True API ГИС МТ (официальный, нужен токен)",
-            "Mock (тестовые заглушки без сети)"
-        )
-        apiModeSpinner = Spinner(this).apply {
-            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, modeLabels)
-        }
-
-        apiTokenInput = EditText(this).apply {
-            hint = "Bearer-токен ЧЗ (при необходимости)"
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.parseColor("#6B7280"))
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            background = roundBg("#181B22", "#2A2F3D", 10)
-        }
-
-        body.addView(hintTv)
-        body.addView(makeFieldLabel("URL Cloudflare Worker"))
-        body.addView(workerUrlInput)
-        body.addView(makeFieldLabel("Режим работы воркера", topMarginDp = 12))
-        body.addView(apiModeSpinner)
-        body.addView(makeFieldLabel("Токен (если не сохранён в Cloudflare Secrets)", topMarginDp = 12))
-        body.addView(apiTokenInput)
-        page.addView(body, LinearLayout.LayoutParams(-1, 0, 1f))
-
-        apiFooter = LinearLayout(this).apply {
-            setBackgroundColor(Color.parseColor("#181B22"))
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-        }
-        val saveBtn = makeChipButton("Сохранить настройки", "#3B82F6", "#FFFFFF").apply {
-            textSize = 14f
-            setPadding(dp(14), dp(13), dp(14), dp(13))
-            setOnClickListener {
-                var u = workerUrlInput.text.toString().trim().trimEnd('/')
-                if (u.isNotEmpty() && !u.startsWith("http")) u = "https://$u"
-                workerUrl = u
-                apiMode = apiModes[apiModeSpinner.selectedItemPosition]
-                apiToken = apiTokenInput.text.toString().trim()
-                getSharedPreferences("revizor_cfg", MODE_PRIVATE).edit()
-                    .putString("workerUrl", workerUrl)
-                    .putString("apiMode", apiMode)
-                    .putString("apiToken", apiToken)
-                    .apply()
-                syncApiButtonStyle()
-                page.visibility = View.GONE
-                Toast.makeText(this@MainActivity, "Настройки сохранены", Toast.LENGTH_SHORT).show()
-            }
-        }
-        apiFooter.addView(saveBtn, LinearLayout.LayoutParams(-1, -2))
-        page.addView(apiFooter)
-
-        return page
-    }
-
-    private fun openApiPage() {
-        workerUrlInput.setText(workerUrl)
-        apiModeSpinner.setSelection(apiModes.indexOf(apiMode).coerceAtLeast(0))
-        apiTokenInput.setText(apiToken)
-        apiPage.visibility = View.VISIBLE
-    }
-
-    private fun syncApiButtonStyle() {
-        when {
-            workerUrl.isEmpty() -> {
-                apiBtn.text = "⚙️ API"
-                apiBtn.setTextColor(Color.parseColor("#F3F4F6"))
-                apiBtn.background = roundBg("#232834", "#2A2F3D", 8)
-            }
-            apiMode == "mock" -> {
-                apiBtn.text = "⚙️ Mock"
-                apiBtn.setTextColor(Color.parseColor("#F59E0B"))
-                apiBtn.background = roundBg("#232834", "#F59E0B", 8)
-            }
-            else -> {
-                apiBtn.text = "⚙️ API"
-                apiBtn.setTextColor(Color.parseColor("#06B6D4"))
-                apiBtn.background = roundBg("#232834", "#06B6D4", 8)
-            }
-        }
-    }
-
-    // --- Кнопка Тест ---
-    private fun runTestSimulation() {
-        val stamp = System.currentTimeMillis()
-        val samples = listOf(
-            "010460068253201921SN_TEST_${stamp}_$simIndex\u001D93ABCD",
-            "010460700123456721SN_EXP_${stamp}_$simIndex\u001D17250115\u001D93WXYZ",
-            "010460700987654321SN_OK_${stamp}_$simIndex\u001D17281231\u001D93QWER"
-        )
-        val code = samples[simIndex % samples.size]
-        simIndex++
-        handleScannedCode(code)
-    }
-
-    // --- Запуск CameraX + анализатора кадров ---
-    private fun startCamera() {
-        val providerFuture = ProcessCameraProvider.getInstance(this)
-        providerFuture.addListener({
-            val provider = providerFuture.get()
-            val preview = Preview.Builder().build().also {
-                it.surfaceProvider = previewView.surfaceProvider
-            }
-
-            val resSelector = ResolutionSelector.Builder()
-                .setResolutionStrategy(
-                    ResolutionStrategy(Size(1280, 720), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)
-                )
-                .build()
-
-            val analysis = ImageAnalysis.Builder()
-                .setResolutionSelector(resSelector)
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .build()
-
-            analysis.setAnalyzer(cameraExecutor) { imageProxy ->
-                processFrame(imageProxy)
-            }
-
-            try {
-                provider.unbindAll()
-                camera = provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
-                if (zoomLevel > 1f) camera?.cameraControl?.setZoomRatio(zoomLevel)
-                if (torchOn) camera?.cameraControl?.enableTorch(true)
-            } catch (e: Exception) {
-                Toast.makeText(this, "Ошибка камеры: ${e.message}", Toast.LENGTH_LONG).show()
-            }
-        }, ContextCompat.getMainExecutor(this))
-    }
-
-    // --- Обработка кадра: обычный проход + инверсия/склейка точек для чёрных ключей ---
-    private fun processFrame(imageProxy: ImageProxy) {
-        val rotation = imageProxy.imageInfo.rotationDegrees
-        val width = imageProxy.width
-        val height = imageProxy.height
-        val yPlane = imageProxy.planes[0]
-        val yBuffer = yPlane.buffer
-        val rowStride = yPlane.rowStride
-        val pixelStride = yPlane.pixelStride
-
-        frameIndex++
-        val useInvertedDpm = dpmMode && (frameIndex % 2 == 1)
-
-        val inputImage: InputImage = if (!useInvertedDpm) {
-            val nv21 = ByteArray(width * height * 3 / 2)
-            var outIdx = 0
-            for (r in 0 until height) {
-                val rowStart = r * rowStride
-                for (c in 0 until width) {
-                    nv21[outIdx++] = yBuffer.get(rowStart + c * pixelStride)
-                }
-            }
-            java.util.Arrays.fill(nv21, width * height, nv21.size, 0x80.toByte())
-            InputImage.fromByteArray(nv21, width, height, rotation, InputImage.IMAGE_FORMAT_NV21)
         } else {
-            val cropSize = (minOf(width, height) * 0.50).toInt() and 0xFFFE
-            val startX = ((width - cropSize) / 2) and 0xFFFE
-            val startY = ((height - cropSize) / 2) and 0xFFFE
-
-            val rawY = IntArray(cropSize * cropSize)
-            var idx = 0
-            for (r in 0 until cropSize) {
-                val rowStart = (startY + r) * rowStride
-                for (c in 0 until cropSize) {
-                    rawY[idx++] = yBuffer.get(rowStart + (startX + c) * pixelStride).toInt() and 0xFF
+            vibrator?.vibrate(VibrationEffect.createOneShot(38, VibrationEffect.DEFAULT_AMPLITUDE))
+            if (soundEnabled) {
+                toneGen?.startTone(ToneGenerator.TONE_PROP_BEEP, 110)
+            }
+            if (flashEnabled) {
+                flashType = FlashType.VALID
+                scope.launch {
+                    delay(350)
+                    flashType = FlashType.NONE
                 }
             }
+        }
+    }
 
-            val nv21 = ByteArray(cropSize * cropSize * 3 / 2)
-            for (r in 0 until cropSize) {
-                for (c in 0 until cropSize) {
-                    var sum = 0
-                    var count = 0
-                    for (dr in -1..1) {
-                        val nr = r + dr
-                        if (nr < 0 || nr >= cropSize) continue
-                        val rowOff = nr * cropSize
-                        for (dc in -1..1) {
-                            val nc = c + dc
-                            if (nc < 0 || nc >= cropSize) continue
-                            sum += rawY[rowOff + nc]
-                            count++
+    // Обработка входящего скана (с камеры или с ТСД)
+    var lastScanStamp by remember { mutableStateOf("" to 0L) }
+
+    fun onRawBarcodeDetected(rawText: String) {
+        val parsed = CrptParser.parse(rawText) ?: return
+        val now = System.currentTimeMillis()
+        if (lastScanStamp.first == parsed.uniqueKey && now - lastScanStamp.second < 1100L) {
+            return
+        }
+        lastScanStamp = parsed.uniqueKey to now
+
+        val existing = items.find { it.uniqueKey == parsed.uniqueKey }
+        if (existing != null) {
+            // Повторное наведение: сразу показываем срок годности из списка на экране!
+            activeBannerKey = existing.uniqueKey
+            isDuplicateBanner = true
+            triggerFeedback(expired = isExpired(existing.expDate), isDuplicate = true)
+            return
+        }
+
+        isDuplicateBanner = false
+        activeBannerKey = parsed.uniqueKey
+        val newItem = ScannedItem(
+            uniqueKey = parsed.uniqueKey,
+            gtin = parsed.gtin,
+            sn = parsed.sn,
+            raw = parsed.raw,
+            isLoading = true
+        )
+        updateItems(listOf(newItem) + items)
+        apiQueue.trySend(parsed)
+    }
+
+    // Очередь запросов к API с троттлингом 350мс и автоповтором при сбоях связи / 429
+    LaunchedEffect(Unit) {
+        for (task in apiQueue) {
+            delay(350L + Random.nextLong(50L, 140L))
+            var attempt = 0
+            var done = false
+
+            while (attempt < 3 && !done) {
+                attempt++
+                if (attempt > 1) {
+                    updateItems(items.map {
+                        if (it.uniqueKey == task.uniqueKey) {
+                            it.copy(infoMsg = "Повтор запроса ($attempt/3)...")
+                        } else it
+                    })
+                    delay(2200L * (attempt - 1))
+                }
+
+                val res = fetchFromGateway(
+                    endpoint = storage.apiUrl,
+                    mode = storage.apiMode,
+                    token = storage.apiToken,
+                    parsed = task
+                )
+
+                if (res.shouldRetry && attempt < 3) {
+                    continue
+                }
+
+                done = true
+                val expFlag = isExpired(res.expDate) || res.status == "RETIRED"
+                updateItems(items.map {
+                    if (it.uniqueKey == task.uniqueKey) {
+                        it.copy(
+                            name = res.name ?: it.name,
+                            expDate = res.expDate,
+                            status = res.status,
+                            infoMsg = res.error,
+                            isLoading = false
+                        )
+                    } else it
+                })
+
+                if (res.expDate != null || res.status == "RETIRED") {
+                    triggerFeedback(expired = expFlag, isDuplicate = false)
+                }
+            }
+        }
+    }
+
+    // Приём кодов от аппаратного сканера ТСД (Broadcast Intent ScanTool / Seuic AutoID Q9C + HID)
+    LaunchedEffect(Unit) {
+        for (hwCode in hardwareScanFlow) {
+            onRawBarcodeDetected(hwCode)
+        }
+    }
+
+    DisposableEffect(context) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context?, intent: Intent?) {
+                if (intent == null) return
+                val code = intent.getStringExtra("scannerdata") // MERTECH Seuic AutoID Q9C (ScanTool)
+                    ?: intent.getStringExtra("barcode_string")
+                    ?: intent.getStringExtra("data")
+                    ?: intent.getStringExtra("SCAN_BARCODE1")
+                    ?: intent.getStringExtra("value")
+                if (!code.isNullOrBlank()) {
+                    onRawBarcodeDetected(code)
+                }
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction("com.android.server.scannerservice.broadcast") // Seuic ScanTool
+            addAction("android.intent.ACTION_DECODE_DATA")
+            addAction("nlscan.action.SCANNER_RESULT")
+            addAction("com.scanner.broadcast")
+        }
+        ContextCompat.registerReceiver(context, receiver, filter, ContextCompat.RECEIVER_EXPORTED)
+        onDispose {
+            context.unregisterReceiver(receiver)
+        }
+    }
+
+    // Запрос разрешения на камеру только если не в режиме ТСД
+    LaunchedEffect(tsdMode) {
+        if (!tsdMode && !hasCameraPermission) {
+            permissionLauncher.launch(Manifest.permission.CAMERA)
+        }
+    }
+
+    // Лаунчеры сохранения CSV файлов
+    var csvContentToSave by remember { mutableStateOf("") }
+    val csvLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/csv")
+    ) { uri ->
+        if (uri != null) {
+            try {
+                context.contentResolver.openOutputStream(uri)?.use { out ->
+                    OutputStreamWriter(out, StandardCharsets.UTF_8).use { writer ->
+                        writer.write("\uFEFF") // UTF-8 BOM для Excel
+                        writer.write(csvContentToSave)
+                    }
+                }
+                Toast.makeText(context, "CSV успешно сохранён", Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+                Toast.makeText(context, "Ошибка сохранения: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    // Применяем тему и масштаб шрифта
+    val colors = if (darkTheme) DarkScheme else LightScheme
+    val baseDensity = LocalDensity.current
+    val scaledDensity = remember(baseDensity, largeFont) {
+        Density(
+            density = baseDensity.density,
+            fontScale = baseDensity.fontScale * (if (largeFont) 1.22f else 1.0f)
+        )
+    }
+
+    val flashAlpha by animateFloatAsState(
+        targetValue = if (flashType != FlashType.NONE) 0.45f else 0f,
+        animationSpec = tween(durationMillis = 220),
+        label = "flashAlpha"
+    )
+
+    CompositionLocalProvider(LocalDensity provides scaledDensity) {
+        MaterialTheme(colorScheme = colors) {
+            ModalNavigationDrawer(
+                drawerState = drawerState,
+                gesturesEnabled = !isShelfLocked,
+                drawerContent = {
+                    ModalDrawerSheet(
+                        drawerContainerColor = MaterialTheme.colorScheme.surface,
+                        modifier = Modifier.width(310.dp)
+                    ) {
+                        DrawerSettingsContent(
+                            tsdMode = tsdMode,
+                            onTsdModeChange = {
+                                tsdMode = it
+                                storage.tsdMode = it
+                                if (it) torchEnabled = false
+                            },
+                            darkTheme = darkTheme,
+                            onDarkThemeChange = {
+                                darkTheme = it
+                                storage.darkTheme = it
+                            },
+                            largeFont = largeFont,
+                            onLargeFontChange = {
+                                largeFont = it
+                                storage.largeFont = it
+                            },
+                            flashEnabled = flashEnabled,
+                            onFlashEnabledChange = {
+                                flashEnabled = it
+                                storage.flashEnabled = it
+                            },
+                            fifoBarEnabled = fifoBarEnabled,
+                            onFifoBarEnabledChange = {
+                                fifoBarEnabled = it
+                                storage.fifoBarEnabled = it
+                            },
+                            soundEnabled = soundEnabled,
+                            onSoundEnabledChange = {
+                                soundEnabled = it
+                                storage.soundEnabled = it
+                            },
+                            apiUrl = apiUrl,
+                            onApiUrlChange = { apiUrl = it },
+                            apiMode = apiMode,
+                            onApiModeChange = { apiMode = it },
+                            apiToken = apiToken,
+                            onApiTokenChange = { apiToken = it },
+                            onSaveApi = {
+                                storage.apiUrl = apiUrl
+                                storage.apiMode = apiMode
+                                storage.apiToken = apiToken
+                                Toast.makeText(context, "Настройки шлюза сохранены", Toast.LENGTH_SHORT).show()
+                            },
+                            onOpenManualAdd = {
+                                scope.launch { drawerState.close() }
+                                showManualAddDialog = true
+                            }
+                        )
+                    }
+                }
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(MaterialTheme.colorScheme.background)
+                ) {
+                    Column(modifier = Modifier.fillMaxSize()) {
+                        // ===== ВЕРХНЯЯ ПАНЕЛЬ УПРАВЛЕНИЯ =====
+                        TopControlHeader(
+                            thresholdDate = thresholdDate,
+                            offsetDays = offsetDays,
+                            onSelectOffset = { days ->
+                                offsetDays = days
+                                storage.offsetDays = days
+                            },
+                            tsdMode = tsdMode,
+                            zoomPresetIndex = zoomPresetIndex,
+                            onCycleZoom = { zoomPresetIndex = (zoomPresetIndex + 1) % 4 },
+                            torchEnabled = torchEnabled,
+                            onToggleTorch = { torchEnabled = !torchEnabled },
+                            fullFrameScan = fullFrameScan,
+                            onToggleScanArea = { fullFrameScan = !fullFrameScan },
+                            onOpenDrawer = { scope.launch { drawerState.open() } },
+                            onLockScreen = { isShelfLocked = true },
+                            onRequestReset = {
+                                if (items.isNotEmpty()) showResetConfirm = true
+                            }
+                        )
+
+                        // ===== ОСНОВНАЯ РАБОЧАЯ ОБЛАСТЬ =====
+                        val activeItem = items.find { it.uniqueKey == activeBannerKey } ?: items.firstOrNull()
+                        val expiredCount = items.count { isExpired(it.expDate) || it.status == "RETIRED" }
+                        val noDateCount = items.count { it.expDate == null && !it.isLoading }
+
+                        if (tsdMode) {
+                            // РЕЖИМ ТСД (БЕЗ КАМЕРЫ): Крупная плашка последнего скана + Сразу весь список
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(horizontal = 10.dp)
+                            ) {
+                                ActiveScanBannerCard(
+                                    item = activeItem,
+                                    isDuplicate = isDuplicateBanner,
+                                    isExpired = isExpired(activeItem?.expDate) || activeItem?.status == "RETIRED",
+                                    today = today,
+                                    thresholdDate = thresholdDate,
+                                    fifoBarEnabled = fifoBarEnabled,
+                                    isTsdLarge = true
+                                )
+
+                                Spacer(Modifier.height(8.dp))
+
+                                ScannedListSection(
+                                    items = items,
+                                    selectedTab = selectedTab,
+                                    onSelectTab = { selectedTab = it },
+                                    searchQuery = searchQuery,
+                                    onSearchChange = { searchQuery = it },
+                                    groupByName = groupByName,
+                                    onToggleGroup = {
+                                        groupByName = it
+                                        storage.groupByName = it
+                                    },
+                                    expandedGroups = expandedGroups,
+                                    onToggleGroupExpand = { key ->
+                                        expandedGroups = if (key in expandedGroups) expandedGroups - key else expandedGroups + key
+                                    },
+                                    isExpiredFn = { isExpired(it.expDate) || it.status == "RETIRED" },
+                                    today = today,
+                                    thresholdDate = thresholdDate,
+                                    fifoBarEnabled = fifoBarEnabled,
+                                    onDeleteItem = { key -> updateItems(items.filterNot { it.uniqueKey == key }) },
+                                    onExportExpiredCsv = {
+                                        csvContentToSave = buildCsv(items.filter { isExpired(it.expDate) || it.status == "RETIRED" }, thresholdDate)
+                                        csvLauncher.launch("AOR_Prosrochka_${LocalDate.now()}.csv")
+                                    },
+                                    onExportAllCsv = {
+                                        csvContentToSave = buildCsv(items, thresholdDate)
+                                        csvLauncher.launch("AOR_Reviziya_${LocalDate.now()}.csv")
+                                    },
+                                    onCopySummary = {
+                                        val txt = buildMessengerSummary(items, thresholdDate) { isExpired(it.expDate) || it.status == "RETIRED" }
+                                        clipboard.setText(AnnotatedString(txt))
+                                        Toast.makeText(context, "Сводка скопирована для мессенджера", Toast.LENGTH_SHORT).show()
+                                    },
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                        } else {
+                            // РЕЖИМ СМАРТФОНА (КАМЕРА + НИЖНИЙ HUD)
+                            Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                                if (hasCameraPermission) {
+                                    CameraScannerView(
+                                        zoomPresetIndex = zoomPresetIndex,
+                                        torchEnabled = torchEnabled,
+                                        fullFrameScan = fullFrameScan,
+                                        onBarcodeScanned = ::onRawBarcodeDetected
+                                    )
+                                } else {
+                                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                        Button(onClick = { permissionLauncher.launch(Manifest.permission.CAMERA) }) {
+                                            Text("Разрешить доступ к камере")
+                                        }
+                                    }
+                                }
+
+                                // Нижняя панель счётчиков и последнего скана
+                                Column(
+                                    modifier = Modifier
+                                        .align(Alignment.BottomCenter)
+                                        .fillMaxWidth()
+                                        .background(MaterialTheme.colorScheme.background.copy(alpha = 0.92f))
+                                        .padding(10.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        StatCounterChip(
+                                            count = items.size,
+                                            label = "Всего",
+                                            accent = MaterialTheme.colorScheme.onSurface,
+                                            modifier = Modifier.weight(1f),
+                                            onClick = {
+                                                selectedTab = FilterTab.ALL
+                                                showListSheet = true
+                                            }
+                                        )
+                                        StatCounterChip(
+                                            count = expiredCount,
+                                            label = "Просрочка",
+                                            accent = Color(0xFFEF4444),
+                                            modifier = Modifier.weight(1f),
+                                            onClick = {
+                                                selectedTab = FilterTab.EXPIRED
+                                                showListSheet = true
+                                            }
+                                        )
+                                        StatCounterChip(
+                                            count = noDateCount,
+                                            label = "Без даты",
+                                            accent = Color(0xFFF59E0B),
+                                            modifier = Modifier.weight(1f),
+                                            onClick = {
+                                                selectedTab = FilterTab.NO_DATE
+                                                showListSheet = true
+                                            }
+                                        )
+                                    }
+
+                                    Spacer(Modifier.height(8.dp))
+
+                                    ActiveScanBannerCard(
+                                        item = activeItem,
+                                        isDuplicate = isDuplicateBanner,
+                                        isExpired = isExpired(activeItem?.expDate) || activeItem?.status == "RETIRED",
+                                        today = today,
+                                        thresholdDate = thresholdDate,
+                                        fifoBarEnabled = fifoBarEnabled,
+                                        isTsdLarge = false,
+                                        onClick = { showListSheet = true }
+                                    )
+                                }
+                            }
                         }
                     }
-                    val blurred = sum / count
-                    val inverted = 255 - blurred
-                    val contrasted = (((inverted - 128) * 2.4f) + 128f).toInt().coerceIn(0, 255)
-                    nv21[r * cropSize + c] = contrasted.toByte()
-                }
-            }
-            java.util.Arrays.fill(nv21, cropSize * cropSize, nv21.size, 0x80.toByte())
-            InputImage.fromByteArray(nv21, cropSize, cropSize, rotation, InputImage.IMAGE_FORMAT_NV21)
-        }
 
-        scanner.process(inputImage)
-            .addOnSuccessListener { barcodes ->
-                for (b in barcodes) {
-                    val raw = b.rawValue ?: continue
-                    if (raw.isNotEmpty()) handleScannedCode(raw)
+                    // ===== ПОЛНОЭКРАННАЯ ЦВЕТОВАЯ ВСПЫШКА ПРИ СКАНЕ =====
+                    if (flashAlpha > 0f) {
+                        val flashColor = if (flashType == FlashType.EXPIRED) Color(0xFFEF4444) else Color(0xFF10B981)
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .border(10.dp, flashColor.copy(alpha = flashAlpha * 2f))
+                                .background(flashColor.copy(alpha = flashAlpha * 0.35f))
+                        )
+                    }
+
+                    // ===== «ЗАМОК ОТ ПОЛКИ» (БЛОКИРОВКА СЛУЧАЙНЫХ КАСАНИЙ) =====
+                    if (isShelfLocked) {
+                        ShelfLockOverlay(onUnlock = { isShelfLocked = false })
+                    }
                 }
             }
-            .addOnCompleteListener {
-                imageProxy.close()
+
+            // ===== НИЖНИЙ ЛИСТ СО СПИСКОМ (ДЛЯ РЕЖИМА СМАРТФОНА) =====
+            if (showListSheet && !tsdMode) {
+                ModalBottomSheet(
+                    onDismissRequest = { showListSheet = false },
+                    containerColor = MaterialTheme.colorScheme.background,
+                    modifier = Modifier.fillMaxHeight(0.92f)
+                ) {
+                    ScannedListSection(
+                        items = items,
+                        selectedTab = selectedTab,
+                        onSelectTab = { selectedTab = it },
+                        searchQuery = searchQuery,
+                        onSearchChange = { searchQuery = it },
+                        groupByName = groupByName,
+                        onToggleGroup = {
+                            groupByName = it
+                            storage.groupByName = it
+                        },
+                        expandedGroups = expandedGroups,
+                        onToggleGroupExpand = { key ->
+                            expandedGroups = if (key in expandedGroups) expandedGroups - key else expandedGroups + key
+                        },
+                        isExpiredFn = { isExpired(it.expDate) || it.status == "RETIRED" },
+                        today = today,
+                        thresholdDate = thresholdDate,
+                        fifoBarEnabled = fifoBarEnabled,
+                        onDeleteItem = { key -> updateItems(items.filterNot { it.uniqueKey == key }) },
+                        onExportExpiredCsv = {
+                            csvContentToSave = buildCsv(items.filter { isExpired(it.expDate) || it.status == "RETIRED" }, thresholdDate)
+                            csvLauncher.launch("AOR_Prosrochka_${LocalDate.now()}.csv")
+                        },
+                        onExportAllCsv = {
+                            csvContentToSave = buildCsv(items, thresholdDate)
+                            csvLauncher.launch("AOR_Reviziya_${LocalDate.now()}.csv")
+                        },
+                        onCopySummary = {
+                            val txt = buildMessengerSummary(items, thresholdDate) { isExpired(it.expDate) || it.status == "RETIRED" }
+                            clipboard.setText(AnnotatedString(txt))
+                            Toast.makeText(context, "Сводка скопирована для мессенджера", Toast.LENGTH_SHORT).show()
+                        },
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(horizontal = 12.dp)
+                    )
+                }
             }
+
+            // ===== ПОДТВЕРЖДЕНИЕ СБРОСА СПИСКА =====
+            if (showResetConfirm) {
+                AlertDialog(
+                    onDismissRequest = { showResetConfirm = false },
+                    title = { Text("Очистить смену?") },
+                    text = { Text("Будут удалены все отсканированные позиции (${items.size} шт.). Это действие нельзя отменить.") },
+                    confirmButton = {
+                        TextButton(
+                            onClick = {
+                                updateItems(emptyList())
+                                activeBannerKey = null
+                                showResetConfirm = false
+                            }
+                        ) {
+                            Text("Очистить", color = Color(0xFFEF4444), fontWeight = FontWeight.Bold)
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showResetConfirm = false }) {
+                            Text("Отмена")
+                        }
+                    }
+                )
+            }
+
+            // ===== ДИАЛОГ РУЧНОГО ДОБАВЛЕНИЯ ПОЗИЦИИ =====
+            if (showManualAddDialog) {
+                ManualAddItemDialog(
+                    existingNames = items.mapNotNull { it.name }.distinct(),
+                    onDismiss = { showManualAddDialog = false },
+                    onAdd = { name, expIso, qty ->
+                        val now = System.currentTimeMillis()
+                        val added = (1..qty).map { idx ->
+                            ScannedItem(
+                                uniqueKey = "MANUAL_${now}_$idx",
+                                gtin = "РУЧНОЙ_ВВОД",
+                                sn = "№$idx",
+                                raw = "",
+                                name = name.ifBlank { "Товар без штрихкода" },
+                                expDate = expIso,
+                                status = "MANUAL",
+                                infoMsg = "Добавлено вручную",
+                                isLoading = false,
+                                isManual = true,
+                                scannedAt = now + idx
+                            )
+                        }
+                        updateItems(added + items)
+                        activeBannerKey = added.first().uniqueKey
+                        isDuplicateBanner = false
+                        showManualAddDialog = false
+                        Toast.makeText(context, "Добавлено: $qty шт.", Toast.LENGTH_SHORT).show()
+                    }
+                )
+            }
+        }
+    }
+}
+
+// ==================== ВЕРХНЯЯ ПАНЕЛЬ ====================
+
+@Composable
+private fun TopControlHeader(
+    thresholdDate: LocalDate,
+    offsetDays: Int,
+    onSelectOffset: (Int) -> Unit,
+    tsdMode: Boolean,
+    zoomPresetIndex: Int,
+    onCycleZoom: () -> Unit,
+    torchEnabled: Boolean,
+    onToggleTorch: () -> Unit,
+    fullFrameScan: Boolean,
+    onToggleScanArea: () -> Unit,
+    onOpenDrawer: () -> Unit,
+    onLockScreen: () -> Unit,
+    onRequestReset: () -> Unit
+) {
+    val fmt = remember { DateTimeFormatter.ofPattern("dd.MM") }
+    val zoomLabel = when (zoomPresetIndex) {
+        0 -> "0.6x"
+        1 -> "1x"
+        2 -> "2x"
+        else -> "3x"
     }
 
-    // --- Парсер GS1 DataMatrix ---
-    private fun parseGs1(raw: String): ScanRecord {
-        var str = raw.replace(Regex("^\\][a-zA-Z0-9]{2}"), "").trimStart('\u001D')
-        val gs = '\u001D'
-        var gtin: String? = null
-        var serial: String? = null
-        var expMillis: Long? = null
-        var i = 0
-
-        while (i < str.length) {
-            if (str[i] == gs) {
-                i++
-                continue
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surface)
+            .statusBarsPadding()
+            .padding(horizontal = 8.dp, vertical = 6.dp)
+    ) {
+        // Ряд 1: Меню, Порог даты, Инструменты камеры/Замок, Сброс
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            IconButton(
+                onClick = onOpenDrawer,
+                modifier = Modifier.size(36.dp)
+            ) {
+                Icon(Icons.Default.Menu, contentDescription = "Меню", tint = MaterialTheme.colorScheme.onSurface)
             }
-            val ai2 = if (i + 2 <= str.length) str.substring(i, i + 2) else ""
-            if (ai2 == "01" && i + 16 <= str.length) {
-                gtin = str.substring(i + 2, i + 16)
-                i += 16
-            } else if ((ai2 == "17" || ai2 == "11" || ai2 == "15") && i + 8 <= str.length) {
-                if (ai2 == "17") expMillis = parseYyMmDd(str.substring(i + 2, i + 8))
-                i += 8
-            } else if (ai2 in listOf("21", "10", "91", "92", "93")) {
-                val nextGs = str.indexOf(gs, i + 2)
-                val end = if (nextGs == -1) str.length else nextGs
-                if (ai2 == "21") serial = str.substring(i + 2, end)
-                i = if (nextGs == -1) end else end + 1
-            } else {
-                val nextGs = str.indexOf(gs, i)
-                if (nextGs == -1) break
-                i = nextGs + 1
+
+            Surface(
+                shape = RoundedCornerShape(8.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                modifier = Modifier.weight(1f)
+            ) {
+                Text(
+                    text = if (tsdMode) "ТСД • До ${thresholdDate.format(fmt)}" else "До ${thresholdDate.format(fmt)}",
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 13.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+
+            if (!tsdMode) {
+                SmallActionChip(text = zoomLabel, onClick = onCycleZoom)
+                SmallActionChip(
+                    text = if (fullFrameScan) "Весь" else "Центр",
+                    onClick = onToggleScanArea
+                )
+                IconButton(
+                    onClick = onToggleTorch,
+                    modifier = Modifier
+                        .size(34.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(if (torchEnabled) Color(0xFFF59E0B) else MaterialTheme.colorScheme.surfaceVariant)
+                ) {
+                    Icon(
+                        imageVector = if (torchEnabled) Icons.Default.FlashOn else Icons.Default.FlashOff,
+                        contentDescription = "Фонарик",
+                        tint = if (torchEnabled) Color.Black else MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+
+            IconButton(
+                onClick = onLockScreen,
+                modifier = Modifier
+                    .size(34.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Lock,
+                    contentDescription = "Замок экрана",
+                    tint = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.size(16.dp)
+                )
+            }
+
+            SmallActionChip(text = "Сброс", onClick = onRequestReset)
+        }
+
+        Spacer(Modifier.height(6.dp))
+
+        // Ряд 2: Быстрые пресеты дат
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            val presets = listOf(0 to "Сегодня", 1 to "+1 дн", 3 to "+3 дн", 7 to "+7 дн", 14 to "+14 дн")
+            presets.forEach { (days, label) ->
+                val active = offsetDays == days
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
+                    modifier = Modifier
+                        .weight(1f)
+                        .clickable { onSelectOffset(days) }
+                ) {
+                    Text(
+                        text = label,
+                        modifier = Modifier.padding(vertical = 6.dp),
+                        textAlign = TextAlign.Center,
+                        fontSize = 12.sp,
+                        fontWeight = if (active) FontWeight.Bold else FontWeight.Medium,
+                        color = if (active) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
+                    )
+                }
             }
         }
+    }
+}
 
-        if (expMillis == null) {
-            val m = Regex("\u001D17(\\d{6})").find(str)
-            if (m != null) expMillis = parseYyMmDd(m.groupValues[1])
-        }
-
-        val uniqueKey = if (gtin != null && serial != null) "${gtin}_$serial" else raw
-        val cis = if (gtin != null && serial != null) "01${gtin}21$serial"
-        else str.replace(Regex("\u001D9[123].*$"), "")
-
-        val status = when {
-            expMillis != null -> if (expMillis <= thresholdMillis) "bad" else "ok"
-            workerUrl.isNotEmpty() -> "pending"
-            else -> "nodate"
-        }
-
-        return ScanRecord(
-            uniqueKey = uniqueKey,
-            raw = raw,
-            gtin = gtin,
-            serial = serial,
-            cis = cis,
-            status = status,
-            expMillis = expMillis,
-            name = null,
-            apiStatus = null,
-            error = null,
-            scannedAt = System.currentTimeMillis()
+@Composable
+private fun SmallActionChip(text: String, onClick: () -> Unit) {
+    Surface(
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        modifier = Modifier.clickable(onClick = onClick)
+    ) {
+        Text(
+            text = text,
+            modifier = Modifier.padding(horizontal = 9.dp, vertical = 7.dp),
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurface
         )
     }
+}
 
-    private fun parseYyMmDd(s: String): Long? {
-        if (!s.matches(Regex("\\d{6}"))) return null
-        val yy = s.substring(0, 2).toInt()
-        val mm = s.substring(2, 4).toInt()
-        val dd = s.substring(4, 6).toInt()
-        if (mm < 1 || mm > 12 || dd > 31) return null
-        val cal = Calendar.getInstance().apply {
-            set(Calendar.YEAR, 2000 + yy)
-            set(Calendar.MONTH, mm - 1)
-            set(Calendar.DAY_OF_MONTH, 1)
-            if (dd == 0) {
-                set(Calendar.DAY_OF_MONTH, getActualMaximum(Calendar.DAY_OF_MONTH))
-            } else {
-                set(Calendar.DAY_OF_MONTH, dd)
-            }
-            set(Calendar.HOUR_OF_DAY, 0)
-            set(Calendar.MINUTE, 0)
-            set(Calendar.SECOND, 0)
-            set(Calendar.MILLISECOND, 0)
+// ==================== КАРТОЧКА ТЕКУЩЕГО / ПОСЛЕДНЕГО СКАНА ====================
+
+@Composable
+private fun ActiveScanBannerCard(
+    item: ScannedItem?,
+    isDuplicate: Boolean,
+    isExpired: Boolean,
+    today: LocalDate,
+    thresholdDate: LocalDate,
+    fifoBarEnabled: Boolean,
+    isTsdLarge: Boolean,
+    onClick: (() -> Unit)? = null
+) {
+    if (item == null) {
+        Surface(
+            shape = RoundedCornerShape(12.dp),
+            color = MaterialTheme.colorScheme.surface,
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+            modifier = Modifier
+                .fillMaxWidth()
+                .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
+        ) {
+            Text(
+                text = "Наведите сканер на DataMatrix «Честного ЗНАКа»",
+                modifier = Modifier.padding(if (isTsdLarge) 18.dp else 14.dp),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = if (isTsdLarge) 15.sp else 13.sp,
+                textAlign = TextAlign.Center
+            )
         }
-        return cal.timeInMillis
+        return
     }
 
-    private fun handleScannedCode(raw: String) {
-        val candidate = parseGs1(raw)
-        val existing = items.putIfAbsent(candidate.uniqueKey, candidate)
-        if (existing != null) return
-
-        mainHandler.post {
-            saveSession()
-            updateStatsUi()
-            updateLastScanCard(candidate)
-            if (listPage.visibility == View.VISIBLE) renderFullList()
-            when (candidate.status) {
-                "bad" -> {
-                    playAlarm("bad")
-                    overlayView.flashBorder(Color.parseColor("#EF4444"))
-                    rebuildMiniBadLog()
-                }
-                "ok" -> {
-                    playAlarm("ok")
-                    overlayView.flashBorder(Color.parseColor("#22C55E"))
-                }
-                "pending" -> {
-                    playAlarm("queued")
-                    enqueueForWorker(candidate)
-                }
-                else -> {
-                    playAlarm("nodate")
-                    overlayView.flashBorder(Color.parseColor("#F59E0B"))
-                }
-            }
-        }
+    val borderColor = when {
+        item.isLoading -> Color(0xFF3B82F6)
+        isExpired -> Color(0xFFEF4444)
+        item.expDate != null -> Color(0xFF10B981)
+        else -> Color(0xFFF59E0B)
     }
 
-    // --- Фоновая очередь в Cloudflare Worker ---
-    private fun enqueueForWorker(record: ScanRecord) {
-        if (workerUrl.isEmpty()) return
-        synchronized(queueLock) {
-            apiQueue.add(record)
-            updateQueueBadgeUi()
-            if (!flushScheduled) {
-                flushScheduled = true
-                mainHandler.postDelayed({ flushApiQueue() }, 150)
-            }
-        }
+    val bgTint = when {
+        item.isLoading -> MaterialTheme.colorScheme.surface
+        isExpired -> Color(0xFFEF4444).copy(alpha = 0.14f)
+        item.expDate != null -> Color(0xFF10B981).copy(alpha = 0.12f)
+        else -> Color(0xFFF59E0B).copy(alpha = 0.12f)
     }
 
-    private fun flushApiQueue() {
-        val batch: List<ScanRecord>
-        synchronized(queueLock) {
-            flushScheduled = false
-            if (apiQueue.isEmpty()) return
-            val takeCount = minOf(25, apiQueue.size)
-            batch = apiQueue.take(takeCount).toList()
-            repeat(takeCount) { apiQueue.removeAt(0) }
-            inFlightCount += batch.size
-            updateQueueBadgeUi()
-        }
-
-        networkExecutor.execute {
-            try {
-                val payload = JSONObject()
-                val arr = JSONArray()
-                for (rec in batch) {
-                    arr.put(JSONObject().apply {
-                        put("uniqueKey", rec.uniqueKey)
-                        put("cis", rec.cis)
-                        put("raw", rec.raw)
-                    })
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(2.dp, borderColor),
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
+    ) {
+        Column(
+            modifier = Modifier
+                .background(bgTint)
+                .padding(if (isTsdLarge) 14.dp else 11.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                val statusTitle = when {
+                    item.isLoading -> "⏳ Запрос в Честный ЗНАК..."
+                    item.status == "RETIRED" -> "⛔ ВЫБЫЛ ИЗ ОБОРОТА!"
+                    isExpired -> "🚨 ПРОСРОЧКА / СПИСАТЬ"
+                    item.expDate != null -> "✅ ГОДЕН"
+                    else -> "⚠️ НЕТ ДАТЫ В ЧЗ"
                 }
-                payload.put("items", arr)
-
-                val conn = (URL(workerUrl).openConnection() as HttpURLConnection).apply {
-                    requestMethod = "POST"
-                    connectTimeout = 10000
-                    readTimeout = 10000
-                    doOutput = true
-                    setRequestProperty("Content-Type", "application/json; charset=utf-8")
-                    setRequestProperty("X-Api-Mode", apiMode)
-                    if (apiToken.isNotEmpty()) setRequestProperty("X-Api-Token", apiToken)
-                }
-
-                OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use {
-                    it.write(payload.toString())
-                }
-
-                val code = conn.responseCode
-                val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-                val respText = stream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-                val json = JSONObject(respText)
-
-                if (code !in 200..299) {
-                    throw Exception(json.optString("error", "HTTP $code"))
-                }
-
-                val results = json.optJSONArray("results") ?: JSONArray()
-                var anyBad = false
-                var lastUpdated: ScanRecord? = null
-
-                for (idx in 0 until results.length()) {
-                    val obj = results.getJSONObject(idx)
-                    val key = obj.optString("uniqueKey")
-                    val rec = items[key] ?: continue
-
-                    if (!obj.isNull("name")) rec.name = obj.optString("name")
-                    if (!obj.isNull("status")) rec.apiStatus = obj.optString("status")
-                    if (!obj.isNull("error")) rec.error = obj.optString("error")
-
-                    val expStr = if (obj.isNull("expDate")) "" else obj.optString("expDate")
-                    if (expStr.length >= 10) {
-                        val d = dateIsoFormat.parse(expStr.substring(0, 10))
-                        if (d != null) rec.expMillis = d.time
-                    }
-
-                    val isRetired = rec.apiStatus == "RETIRED"
-                    val isBadDate = rec.expMillis != null && rec.expMillis!! <= thresholdMillis
-                    rec.status = when {
-                        isBadDate || isRetired -> "bad"
-                        rec.expMillis != null -> "ok"
-                        else -> "nodate"
-                    }
-                    if (rec.status == "bad") anyBad = true
-                    lastUpdated = rec
-                }
-
-                for (rec in batch) {
-                    if (rec.status == "pending") {
-                        rec.status = "nodate"
-                        rec.error = "Нет данных в ответе"
-                    }
-                }
-
-                mainHandler.post {
-                    if (anyBad) {
-                        playAlarm("bad")
-                        overlayView.flashBorder(Color.parseColor("#EF4444"))
-                    } else if (lastUpdated?.status == "ok") {
-                        playAlarm("ok")
-                        overlayView.flashBorder(Color.parseColor("#22C55E"))
-                    }
-                    lastUpdated?.let { updateLastScanCard(it) }
-                }
-            } catch (e: Exception) {
-                for (rec in batch) {
-                    if (rec.status == "pending") {
-                        rec.status = "nodate"
-                        rec.error = e.message ?: "Ошибка сети"
-                    }
-                }
-                mainHandler.post {
-                    batch.lastOrNull()?.let { updateLastScanCard(it) }
-                }
-            } finally {
-                synchronized(queueLock) {
-                    inFlightCount = maxOf(0, inFlightCount - batch.size)
-                }
-                mainHandler.post {
-                    updateQueueBadgeUi()
-                    saveSession()
-                    updateStatsUi()
-                    rebuildMiniBadLog()
-                    if (listPage.visibility == View.VISIBLE) renderFullList()
-                }
-                synchronized(queueLock) {
-                    if (apiQueue.isNotEmpty() && !flushScheduled) {
-                        flushScheduled = true
-                        mainHandler.postDelayed({ flushApiQueue() }, 150)
-                    }
-                }
-            }
-        }
-    }
-
-    // --- Звук, вибрация, UI обновления ---
-    private fun playAlarm(type: String) {
-        val vib = @Suppress("DEPRECATION") (getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator)
-        if (vib != null && vib.hasVibrator()) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                if (type == "bad") {
-                    vib.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 220, 90, 220), -1))
-                } else if (type == "ok") {
-                    vib.vibrate(VibrationEffect.createOneShot(35, VibrationEffect.DEFAULT_AMPLITUDE))
-                }
-            } else {
-                @Suppress("DEPRECATION")
-                if (type == "bad") vib.vibrate(longArrayOf(0, 220, 90, 220), -1)
-                else if (type == "ok") vib.vibrate(35)
-            }
-        }
-
-        if (muted) return
-        try {
-            when (type) {
-                "ok" -> toneGen?.startTone(ToneGenerator.TONE_PROP_BEEP, 80)
-                "bad" -> toneGen?.startTone(ToneGenerator.TONE_CDMA_EMERGENCY_RINGBACK, 320)
-                else -> toneGen?.startTone(ToneGenerator.TONE_PROP_ACK, 40)
-            }
-        } catch (_: Exception) {}
-    }
-
-    private fun updateQueueBadgeUi() {
-        val count = synchronized(queueLock) { apiQueue.size + inFlightCount }
-        if (count > 0) {
-            queueBadge.visibility = View.VISIBLE
-            queueBadge.text = "⏳ API: $count"
-        } else {
-            queueBadge.visibility = View.GONE
-        }
-    }
-
-    private fun updateStatsUi() {
-        var total = 0
-        var bad = 0
-        var nodate = 0
-        for (rec in items.values) {
-            total++
-            if (rec.status == "bad") bad++
-            else if (rec.status == "nodate" || rec.status == "pending") nodate++
-        }
-        statTotalVal.text = total.toString()
-        statBadVal.text = bad.toString()
-        statPendingVal.text = nodate.toString()
-        listPageTitle.text = "Отсканировано: $total"
-    }
-
-    private fun updateLastScanCard(rec: ScanRecord) {
-        val idLine = buildString {
-            if (rec.name != null) append("${rec.name} • ")
-            if (rec.gtin != null) append("GTIN ${rec.gtin}") else append(rec.raw.take(18))
-            if (rec.serial != null) append(" • SN: ${rec.serial}")
-        }
-        lastScanSub.text = idLine
-
-        when (rec.status) {
-            "bad" -> {
-                val dateTxt = rec.expMillis?.let { "ДО ${dateRuFormat.format(Date(it))}" } ?: "УЖЕ ПРОДАН (ВЫБЫЛ)"
-                lastScanTitle.text = "ПРОСРОЧКА / СПИСАТЬ: $dateTxt"
-                lastScanTitle.setTextColor(Color.parseColor("#EF4444"))
-                lastScanCard.background = roundBg("#2A1215", "#EF4444", 8)
-            }
-            "ok" -> {
-                val dateTxt = rec.expMillis?.let { dateRuFormat.format(Date(it)) } ?: "—"
-                lastScanTitle.text = "ГОДЕН: до $dateTxt"
-                lastScanTitle.setTextColor(Color.parseColor("#22C55E"))
-                lastScanCard.background = roundBg("#11141A", "#22C55E", 8)
-            }
-            "pending" -> {
-                lastScanTitle.text = "⏳ Запрос срока в ЧЗ..."
-                lastScanTitle.setTextColor(Color.parseColor("#06B6D4"))
-                lastScanCard.background = roundBg("#11141A", "#06B6D4", 8)
-            }
-            else -> {
-                lastScanTitle.text = rec.error ?: "Нет даты (настройте Worker в ⚙️ API)"
-                lastScanTitle.setTextColor(Color.parseColor("#F59E0B"))
-                lastScanCard.background = roundBg("#11141A", "#F59E0B", 8)
-            }
-        }
-    }
-
-    private fun rebuildMiniBadLog() {
-        badLogContainer.removeAllViews()
-        val badList = items.values.filter { it.status == "bad" }.sortedByDescending { it.scannedAt }
-        for (rec in badList) {
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                setPadding(dp(8), dp(5), dp(8), dp(5))
-                background = roundBg("#2A1215", "#7F1D1D", 6)
-            }
-            val nameTv = TextView(this).apply {
-                text = rec.name ?: rec.gtin ?: rec.raw.take(18)
-                setTextColor(Color.parseColor("#F3F4F6"))
-                textSize = 11f
-                maxLines = 1
-            }
-            val dateTv = TextView(this).apply {
-                text = rec.expMillis?.let { "до ${dateRuFormat.format(Date(it))}" } ?: (rec.apiStatus ?: "Риск")
-                setTextColor(Color.parseColor("#FCA5A5"))
-                textSize = 11f
-                setTypeface(null, Typeface.BOLD)
-            }
-            row.addView(nameTv, LinearLayout.LayoutParams(0, -2, 1f))
-            row.addView(dateTv)
-            badLogContainer.addView(row, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(4) })
-        }
-    }
-
-    // --- Даты и пресеты ---
-    private fun syncThresholdLabels() {
-        val d = Date(thresholdMillis)
-        thresholdBtn.text = "До ${dateShortFormat.format(d)}"
-        expandTopBtn.text = "▼ Меню • до ${dateShortFormat.format(d)}"
-    }
-
-    private fun setThresholdOffset(days: Int) {
-        val cal = Calendar.getInstance().apply {
-            set(Calendar.HOUR_OF_DAY, 0)
-            set(Calendar.MINUTE, 0)
-            set(Calendar.SECOND, 0)
-            set(Calendar.MILLISECOND, 0)
-            add(Calendar.DAY_OF_MONTH, days)
-        }
-        thresholdMillis = cal.timeInMillis
-        syncThresholdLabels()
-        reevaluateAll()
-    }
-
-    private fun openDatePicker() {
-        val cal = Calendar.getInstance().apply { timeInMillis = thresholdMillis }
-        DatePickerDialog(
-            this,
-            { _, y, m, d ->
-                val picked = Calendar.getInstance().apply {
-                    set(y, m, d, 0, 0, 0)
-                    set(Calendar.MILLISECOND, 0)
-                }
-                thresholdMillis = picked.timeInMillis
-                syncThresholdLabels()
-                highlightPreset(-1)
-                reevaluateAll()
-            },
-            cal.get(Calendar.YEAR),
-            cal.get(Calendar.MONTH),
-            cal.get(Calendar.DAY_OF_MONTH)
-        ).show()
-    }
-
-    private fun highlightPreset(activeDays: Int) {
-        for (b in pillButtons) {
-            val active = (b.tag as Int) == activeDays
-            styleChip(b, if (active) "#3B82F6" else "#232834", "#FFFFFF")
-        }
-    }
-
-    private fun reevaluateAll() {
-        for (rec in items.values) {
-            if (rec.expMillis != null) {
-                val isBad = rec.expMillis!! <= thresholdMillis || rec.apiStatus == "RETIRED"
-                rec.status = if (isBad) "bad" else "ok"
-            }
-        }
-        saveSession()
-        updateStatsUi()
-        rebuildMiniBadLog()
-        if (listPage.visibility == View.VISIBLE) renderFullList()
-    }
-
-    // --- Экспорт CSV и сброс ---
-    private fun shareCsv(onlyBad: Boolean) {
-        val list = items.values.filter { !onlyBad || it.status == "bad" }
-        if (list.isEmpty()) {
-            Toast.makeText(this, "Список пуст", Toast.LENGTH_SHORT).show()
-            return
-        }
-        val sb = StringBuilder("\uFEFFСтатус;Наименование;GTIN;Серийный номер;Срок годности;Статус ЧЗ\n")
-        for (r in list) {
-            val st = when (r.status) {
-                "bad" -> "СПИСАТЬ"
-                "ok" -> "ГОДЕН"
-                else -> "БЕЗ ДАТЫ"
-            }
-            val dt = r.expMillis?.let { dateRuFormat.format(Date(it)) } ?: ""
-            sb.append("\"$st\";\"${r.name ?: ""}\";\"${r.gtin ?: ""}\";\"${r.serial ?: ""}\";\"$dt\";\"${r.apiStatus ?: ""}\"\n")
-        }
-        val intent = Intent(Intent.ACTION_SEND).apply {
-            type = "text/csv"
-            putExtra(Intent.EXTRA_SUBJECT, "Ревизия сроков ${dateIsoFormat.format(Date())}")
-            putExtra(Intent.EXTRA_TEXT, sb.toString())
-        }
-        startActivity(Intent.createChooser(intent, "Отправить отчёт ревизии"))
-    }
-
-    private fun confirmReset() {
-        if (items.isEmpty()) return
-        AlertDialog.Builder(this)
-            .setTitle("Очистить список смены?")
-            .setMessage("Будут удалены все ${items.size} отсканированных позиций.")
-            .setPositiveButton("Очистить") { _, _ ->
-                items.clear()
-                synchronized(queueLock) { apiQueue.clear() }
-                getSharedPreferences("revizor_session", MODE_PRIVATE).edit().clear().apply()
-                updateQueueBadgeUi()
-                updateStatsUi()
-                rebuildMiniBadLog()
-                if (listPage.visibility == View.VISIBLE) renderFullList()
-                lastScanTitle.text = "Счётчик сброшен"
-                lastScanTitle.setTextColor(Color.parseColor("#9CA3AF"))
-                lastScanCard.background = roundBg("#11141A", "#2A2F3D", 8)
-            }
-            .setNegativeButton("Отмена", null)
-            .show()
-    }
-
-    // --- Сохранение конфигурации и смены ---
-    private fun loadConfig() {
-        val p = getSharedPreferences("revizor_cfg", MODE_PRIVATE)
-        workerUrl = p.getString("workerUrl", "") ?: ""
-        apiMode = p.getString("apiMode", "mobile_api") ?: "mobile_api"
-        apiToken = p.getString("apiToken", "") ?: ""
-    }
-
-    private fun saveSession() {
-        val arr = JSONArray()
-        for (r in items.values) {
-            arr.put(JSONObject().apply {
-                put("uniqueKey", r.uniqueKey)
-                put("raw", r.raw)
-                put("gtin", r.gtin ?: JSONObject.NULL)
-                put("serial", r.serial ?: JSONObject.NULL)
-                put("cis", r.cis)
-                put("status", r.status)
-                put("expMillis", r.expMillis ?: JSONObject.NULL)
-                put("name", r.name ?: JSONObject.NULL)
-                put("apiStatus", r.apiStatus ?: JSONObject.NULL)
-                put("error", r.error ?: JSONObject.NULL)
-                put("scannedAt", r.scannedAt)
-            })
-        }
-        getSharedPreferences("revizor_session", MODE_PRIVATE).edit()
-            .putString("items", arr.toString())
-            .apply()
-    }
-
-    private fun loadSession() {
-        val raw = getSharedPreferences("revizor_session", MODE_PRIVATE).getString("items", null) ?: return
-        try {
-            val arr = JSONArray(raw)
-            for (i in 0 until arr.length()) {
-                val o = arr.getJSONObject(i)
-                val rec = ScanRecord(
-                    uniqueKey = o.getString("uniqueKey"),
-                    raw = o.getString("raw"),
-                    gtin = if (o.isNull("gtin")) null else o.getString("gtin"),
-                    serial = if (o.isNull("serial")) null else o.getString("serial"),
-                    cis = o.getString("cis"),
-                    status = o.getString("status"),
-                    expMillis = if (o.isNull("expMillis")) null else o.getLong("expMillis"),
-                    name = if (o.isNull("name")) null else o.getString("name"),
-                    apiStatus = if (o.isNull("apiStatus")) null else o.getString("apiStatus"),
-                    error = if (o.isNull("error")) null else o.getString("error"),
-                    scannedAt = o.optLong("scannedAt", System.currentTimeMillis())
+                Text(
+                    text = statusTitle,
+                    color = borderColor,
+                    fontWeight = FontWeight.ExtraBold,
+                    fontSize = if (isTsdLarge) 15.sp else 13.sp
                 )
-                items[rec.uniqueKey] = rec
-                if (rec.status == "pending" && workerUrl.isNotEmpty()) enqueueForWorker(rec)
+
+                if (isDuplicate) {
+                    Surface(
+                        shape = RoundedCornerShape(6.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant
+                    ) {
+                        Text(
+                            text = "Уже в списке",
+                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
             }
-            rebuildMiniBadLog()
-        } catch (_: Exception) {}
-    }
 
-    // --- Вспомогательные UI-методы ---
-    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+            Spacer(Modifier.height(4.dp))
 
-    private fun marginEnd(dpVal: Int) = LinearLayout.LayoutParams(-2, -2).apply { rightMargin = dp(dpVal) }
+            Text(
+                text = item.name ?: "GTIN: ${item.gtin}",
+                fontWeight = FontWeight.Bold,
+                fontSize = if (isTsdLarge) 16.sp else 14.sp,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                color = MaterialTheme.colorScheme.onSurface
+            )
 
-    private fun makeFieldLabel(text: String, topMarginDp: Int = 0): TextView {
-        return TextView(this).apply {
-            this.text = text
-            setTextColor(Color.parseColor("#9CA3AF"))
-            textSize = 12f
-            setTypeface(null, Typeface.BOLD)
-            setPadding(0, dp(topMarginDp), 0, dp(4))
-        }
-    }
+            Spacer(Modifier.height(3.dp))
 
-    private fun roundBg(fillHex: String, strokeHex: String, radiusDp: Int): GradientDrawable {
-        return GradientDrawable().apply {
-            setColor(Color.parseColor(fillHex))
-            setStroke(dp(1), Color.parseColor(strokeHex))
-            cornerRadius = dp(radiusDp).toFloat()
-        }
-    }
-
-    private fun makeChipButton(label: String, bgHex: String, textHex: String, padH: Int = 8): Button {
-        return Button(this).apply {
-            text = label
-            textSize = 11f
-            isAllCaps = false
-            minHeight = 0
-            minimumHeight = 0
-            minWidth = 0
-            minimumWidth = 0
-            setPadding(dp(padH), dp(6), dp(padH), dp(6))
-            styleChip(this, bgHex, textHex)
-        }
-    }
-
-    private fun styleChip(btn: Button, bgHex: String, textHex: String) {
-        btn.setTextColor(Color.parseColor(textHex))
-        btn.background = roundBg(bgHex, "#2A2F3D", 8)
-    }
-
-    private fun makeStatBox(label: String, colorHex: String, onClick: () -> Unit): Pair<LinearLayout, TextView> {
-        val box = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            setPadding(dp(4), dp(5), dp(4), dp(5))
-            background = roundBg("#11141A", "#2A2F3D", 8)
-            setOnClickListener { onClick() }
-        }
-        val valTv = TextView(this).apply {
-            text = "0"
-            setTextColor(Color.parseColor(colorHex))
-            textSize = 16f
-            setTypeface(null, Typeface.BOLD)
-            gravity = Gravity.CENTER
-        }
-        val lblTv = TextView(this).apply {
-            text = label
-            setTextColor(Color.parseColor("#9CA3AF"))
-            textSize = 10f
-            gravity = Gravity.CENTER
-        }
-        box.addView(valTv)
-        box.addView(lblTv)
-        return box to valTv
-    }
-
-    // --- Кастомный слой прицела для крышек и вспышки рамки ---
-    inner class ReticleOverlayView(ctx: Context) : View(ctx) {
-        var showReticle = true
-        private var flashColor: Int? = null
-
-        private val reticlePaint = Paint().apply {
-            color = Color.parseColor("#B306B6D4")
-            style = Paint.Style.STROKE
-            strokeWidth = dp(2).toFloat()
-            pathEffect = DashPathEffect(floatArrayOf(dp(10).toFloat(), dp(7).toFloat()), 0f)
-        }
-
-        private val flashPaint = Paint().apply {
-            style = Paint.Style.STROKE
-            strokeWidth = dp(8).toFloat()
-        }
-
-        fun flashBorder(color: Int) {
-            flashColor = color
-            invalidate()
-            mainHandler.postDelayed({
-                flashColor = null
-                invalidate()
-            }, 350)
-        }
-
-        override fun onDraw(canvas: Canvas) {
-            super.onDraw(canvas)
-            if (showReticle && width > 0 && height > 0) {
-                val size = minOf(width, height) * 0.50f
-                val left = (width - size) / 2f
-                val top = (height - size) / 2f
-                canvas.drawRect(left, top, left + size, top + size, reticlePaint)
+            val dateLine = when {
+                item.expDate != null -> "Срок годности: до ${formatRuDate(item.expDate)}"
+                !item.infoMsg.isNullOrBlank() -> item.infoMsg
+                else -> "GTIN ${item.gtin} • SN: ${item.sn}"
             }
-            flashColor?.let { c ->
-                flashPaint.color = c
-                canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), flashPaint)
+
+            Text(
+                text = dateLine,
+                fontSize = if (isTsdLarge) 15.sp else 13.sp,
+                fontWeight = if (item.expDate != null) FontWeight.Bold else FontWeight.Normal,
+                color = if (isExpired) Color(0xFFEF4444) else MaterialTheme.colorScheme.onSurface
+            )
+
+            if (fifoBarEnabled && item.expDate != null) {
+                Spacer(Modifier.height(6.dp))
+                FifoFreshnessBar(expDateIso = item.expDate, today = today, thresholdDate = thresholdDate)
             }
         }
     }
+}
+
+@Composable
+private fun StatCounterChip(
+    count: Int,
+    label: String,
+    accent: Color,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    Surface(
+        shape = RoundedCornerShape(10.dp),
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+        modifier = modifier.clickable(onClick = onClick)
+    ) {
+        Column(
+            modifier = Modifier.padding(vertical = 6.dp, horizontal = 8.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(text = count.toString(), fontWeight = FontWeight.ExtraBold, fontSize = 16.sp, color = accent)
+            Text(text = label, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+// ==================== ШКАЛА СВЕЖЕСТИ FIFO ====================
+
+@Composable
+private fun FifoFreshnessBar(expDateIso: String, today: LocalDate, thresholdDate: LocalDate) {
+    val parsed = try {
+        LocalDate.parse(expDateIso.take(10))
+    } catch (_: Exception) {
+        return
+    }
+    val daysLeft = ChronoUnit.DAYS.between(today, parsed)
+    val (barColor, fraction, label) = when {
+        !parsed.isAfter(thresholdDate) -> Triple(Color(0xFFEF4444), 1.0f, "Списать")
+        daysLeft <= 3 -> Triple(Color(0xFFF59E0B), 0.65f, "Ротация ($daysLeft дн.)")
+        else -> Triple(Color(0xFF10B981), 0.35f, "Запас ($daysLeft дн.)")
+    }
+
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .height(5.dp)
+                .clip(CircleShape)
+                .background(MaterialTheme.colorScheme.surfaceVariant)
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth(fraction)
+                    .fillMaxHeight()
+                    .background(barColor)
+            )
+        }
+        Spacer(Modifier.width(8.dp))
+        Text(text = label, fontSize = 10.sp, color = barColor, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+// ==================== СПИСОК С АККОРДЕОН-ГРУППИРОВКОЙ И ЭКСПОРТОМ ====================
+
+@Composable
+private fun ScannedListSection(
+    items: List<ScannedItem>,
+    selectedTab: FilterTab,
+    onSelectTab: (FilterTab) -> Unit,
+    searchQuery: String,
+    onSearchChange: (String) -> Unit,
+    groupByName: Boolean,
+    onToggleGroup: (Boolean) -> Unit,
+    expandedGroups: Set<String>,
+    onToggleGroupExpand: (String) -> Unit,
+    isExpiredFn: (ScannedItem) -> Boolean,
+    today: LocalDate,
+    thresholdDate: LocalDate,
+    fifoBarEnabled: Boolean,
+    onDeleteItem: (String) -> Unit,
+    onExportExpiredCsv: () -> Unit,
+    onExportAllCsv: () -> Unit,
+    onCopySummary: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val filtered = remember(items, selectedTab, searchQuery, thresholdDate) {
+        items.filter { item ->
+            val tabMatch = when (selectedTab) {
+                FilterTab.ALL -> true
+                FilterTab.EXPIRED -> isExpiredFn(item)
+                FilterTab.VALID -> item.expDate != null && !isExpiredFn(item)
+                FilterTab.NO_DATE -> item.expDate == null && !item.isLoading
+            }
+            val q = searchQuery.trim().lowercase()
+            val queryMatch = q.isEmpty() ||
+                (item.name?.lowercase()?.contains(q) == true) ||
+                item.gtin.contains(q) ||
+                item.sn.lowercase().contains(q)
+            tabMatch && queryMatch
+        }
+    }
+
+    Column(modifier = modifier) {
+        // Вкладки фильтров + переключатель группировки
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp)
+        ) {
+            FilterTab.entries.forEach { tab ->
+                val active = selectedTab == tab
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
+                    modifier = Modifier.clickable { onSelectTab(tab) }
+                ) {
+                    Text(
+                        text = tab.title,
+                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
+                        fontSize = 12.sp,
+                        fontWeight = if (active) FontWeight.Bold else FontWeight.Medium,
+                        color = if (active) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
+                    )
+                }
+            }
+
+            Spacer(Modifier.weight(1f))
+
+            // Кнопка группировки (аккордеон по наименованию)
+            Surface(
+                shape = RoundedCornerShape(8.dp),
+                color = if (groupByName) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
+                modifier = Modifier.clickable { onToggleGroup(!groupByName) }
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.FolderOpen,
+                        contentDescription = "Группировка",
+                        modifier = Modifier.size(14.dp),
+                        tint = if (groupByName) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        text = "Группы",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (groupByName) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
+                    )
+                }
+            }
+        }
+
+        Spacer(Modifier.height(6.dp))
+
+        // Поле поиска
+        OutlinedTextField(
+            value = searchQuery,
+            onValueChange = onSearchChange,
+            placeholder = { Text("Поиск по названию, GTIN или SN...", fontSize = 13.sp) },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(10.dp),
+            trailingIcon = {
+                if (searchQuery.isNotEmpty()) {
+                    IconButton(onClick = { onSearchChange("") }) {
+                        Icon(Icons.Default.Clear, contentDescription = "Очистить")
+                    }
+                }
+            }
+        )
+
+        Spacer(Modifier.height(6.dp))
+
+        // Список (обычный или сгруппированный аккордеон)
+        LazyColumn(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+            contentPadding = PaddingValues(bottom = 8.dp)
+        ) {
+            if (groupByName) {
+                val grouped = filtered.groupBy { it.name?.trim()?.takeIf { n -> n.isNotEmpty() } ?: "GTIN: ${it.gtin}" }
+                items(grouped.entries.toList(), key = { it.key }) { (groupTitle, groupItems) ->
+                    val isExpanded = groupTitle in expandedGroups
+                    val expInGroup = groupItems.count { isExpiredFn(it) }
+                    val groupBorder = if (expInGroup > 0) Color(0xFFEF4444) else MaterialTheme.colorScheme.outline
+
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = MaterialTheme.colorScheme.surface,
+                        border = BorderStroke(if (expInGroup > 0) 1.5.dp else 1.dp, groupBorder),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp)) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { onToggleGroupExpand(groupTitle) },
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = groupTitle,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 14.sp,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                    Spacer(Modifier.height(3.dp))
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Text(
+                                            text = "Всего: ${groupItems.size} шт.",
+                                            fontSize = 12.sp,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                        if (expInGroup > 0) {
+                                            Text(
+                                                text = "• Просрочка: $expInGroup",
+                                                fontSize = 12.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                color = Color(0xFFEF4444)
+                                            )
+                                        }
+                                    }
+                                }
+                                Icon(
+                                    imageVector = if (isExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                                    contentDescription = "Раскрыть",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+
+                            if (isExpanded) {
+                                Spacer(Modifier.height(8.dp))
+                                HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+                                Spacer(Modifier.height(6.dp))
+                                groupItems.forEach { subItem ->
+                                    SingleUnitRow(
+                                        item = subItem,
+                                        expired = isExpiredFn(subItem),
+                                        today = today,
+                                        thresholdDate = thresholdDate,
+                                        fifoBarEnabled = fifoBarEnabled,
+                                        compact = true,
+                                        onDelete = { onDeleteItem(subItem.uniqueKey) }
+                                    )
+                                    Spacer(Modifier.height(4.dp))
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                items(filtered, key = { it.uniqueKey }) { item ->
+                    SingleUnitRow(
+                        item = item,
+                        expired = isExpiredFn(item),
+                        today = today,
+                        thresholdDate = thresholdDate,
+                        fifoBarEnabled = fifoBarEnabled,
+                        compact = false,
+                        onDelete = { onDeleteItem(item.uniqueKey) }
+                    )
+                }
+            }
+        }
+
+        // Нижние кнопки выгрузки отчётов
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .padding(vertical = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Button(
+                onClick = onExportExpiredCsv,
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626)),
+                shape = RoundedCornerShape(10.dp),
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp),
+                modifier = Modifier.weight(1.2f)
+            ) {
+                Text("📥 CSV Просрочка", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White, maxLines = 1)
+            }
+
+            OutlinedButton(
+                onClick = onCopySummary,
+                shape = RoundedCornerShape(10.dp),
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp),
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("📋 Сводка", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+            }
+
+            OutlinedButton(
+                onClick = onExportAllCsv,
+                shape = RoundedCornerShape(10.dp),
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp),
+                modifier = Modifier.weight(0.9f)
+            ) {
+                Text("📥 Всё", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+            }
+        }
+    }
+}
+
+@Composable
+private fun SingleUnitRow(
+    item: ScannedItem,
+    expired: Boolean,
+    today: LocalDate,
+    thresholdDate: LocalDate,
+    fifoBarEnabled: Boolean,
+    compact: Boolean,
+    onDelete: () -> Unit
+) {
+    val borderColor = when {
+        item.isLoading -> MaterialTheme.colorScheme.primary
+        expired -> Color(0xFFEF4444)
+        item.expDate != null -> Color(0xFF10B981)
+        else -> Color(0xFFF59E0B)
+    }
+
+    Surface(
+        shape = RoundedCornerShape(10.dp),
+        color = if (compact) MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f) else MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, borderColor),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier.padding(10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                if (!compact) {
+                    Text(
+                        text = item.name ?: "Загрузка названия...",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Spacer(Modifier.height(2.dp))
+                }
+
+                Text(
+                    text = "GTIN: ${item.gtin} • SN: ${item.sn}",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                Spacer(Modifier.height(3.dp))
+
+                val statusText = when {
+                    item.isLoading -> "Проверка в Честном ЗНАКе..."
+                    item.status == "RETIRED" -> "ВЫБЫЛ (до ${formatRuDate(item.expDate)})"
+                    expired && item.expDate != null -> "ПРОСРОЧКА: до ${formatRuDate(item.expDate)}"
+                    item.expDate != null -> "Годен: до ${formatRuDate(item.expDate)}"
+                    else -> item.infoMsg ?: "Срок не указан"
+                }
+
+                Text(
+                    text = statusText,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = borderColor
+                )
+
+                if (fifoBarEnabled && item.expDate != null && !compact) {
+                    Spacer(Modifier.height(5.dp))
+                    FifoFreshnessBar(expDateIso = item.expDate, today = today, thresholdDate = thresholdDate)
+                }
+            }
+
+            IconButton(onClick = onDelete, modifier = Modifier.size(30.dp)) {
+                Icon(
+                    imageVector = Icons.Default.Close,
+                    contentDescription = "Удалить",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(16.dp)
+                )
+            }
+        }
+    }
+}
+
+// ==================== БОКОВАЯ ШТОРКА НАСТРОЕК (AOR SYSTEMS) ====================
+
+@Composable
+private fun DrawerSettingsContent(
+    tsdMode: Boolean,
+    onTsdModeChange: (Boolean) -> Unit,
+    darkTheme: Boolean,
+    onDarkThemeChange: (Boolean) -> Unit,
+    largeFont: Boolean,
+    onLargeFontChange: (Boolean) -> Unit,
+    flashEnabled: Boolean,
+    onFlashEnabledChange: (Boolean) -> Unit,
+    fifoBarEnabled: Boolean,
+    onFifoBarEnabledChange: (Boolean) -> Unit,
+    soundEnabled: Boolean,
+    onSoundEnabledChange: (Boolean) -> Unit,
+    apiUrl: String,
+    onApiUrlChange: (String) -> Unit,
+    apiMode: String,
+    onApiModeChange: (String) -> Unit,
+    apiToken: String,
+    onApiTokenChange: (String) -> Unit,
+    onSaveApi: () -> Unit,
+    onOpenManualAdd: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp)
+    ) {
+        Text(
+            text = "Параметры терминала",
+            fontWeight = FontWeight.ExtraBold,
+            fontSize = 18.sp,
+            color = MaterialTheme.colorScheme.onSurface
+        )
+
+        Spacer(Modifier.height(12.dp))
+
+        // 1. Режим ТСД
+        DrawerSectionTitle("Оборудование")
+        DrawerSwitchRow(
+            title = "Режим ТСД (без камеры)",
+            subtitle = "Для MERTECH Seuic AutoID Q9C и 2D-сканеров",
+            checked = tsdMode,
+            onCheckedChange = onTsdModeChange
+        )
+
+        HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+
+        // 2. Внешний вид и индикация
+        DrawerSectionTitle("Дизайн и индикация")
+        DrawerSwitchRow(
+            title = "Тёмная тема (AMOLED)",
+            subtitle = "Выключите для светлой темы в ярком зале",
+            checked = darkTheme,
+            onCheckedChange = onDarkThemeChange
+        )
+        DrawerSwitchRow(
+            title = "Крупный шрифт",
+            subtitle = "Увеличенный интерфейс для 4\" экранов",
+            checked = largeFont,
+            onCheckedChange = onLargeFontChange
+        )
+        DrawerSwitchRow(
+            title = "Цветовая вспышка экрана",
+            subtitle = "Подсветка краёв зелёным/красным при скане",
+            checked = flashEnabled,
+            onCheckedChange = onFlashEnabledChange
+        )
+        DrawerSwitchRow(
+            title = "Шкала свежести (FIFO)",
+            subtitle = "Индикатор ротации по остатку дней",
+            checked = fifoBarEnabled,
+            onCheckedChange = onFifoBarEnabledChange
+        )
+
+        HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+
+        // 3. Звук и инструменты
+        DrawerSectionTitle("Звук и ввод")
+        DrawerSwitchRow(
+            title = "Звуковой сигнал",
+            subtitle = "Виброотклик работает всегда даже без звука",
+            checked = soundEnabled,
+            onCheckedChange = onSoundEnabledChange
+        )
+
+        Spacer(Modifier.height(6.dp))
+
+        OutlinedButton(
+            onClick = onOpenManualAdd,
+            shape = RoundedCornerShape(10.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("Добавить позицию вручную")
+        }
+
+        HorizontalDivider(modifier = Modifier.padding(vertical = 10.dp))
+
+        // 4. Настройки API / Шлюз ЧЗ
+        DrawerSectionTitle("Настройки API / Шлюз ЧЗ")
+        OutlinedTextField(
+            value = apiUrl,
+            onValueChange = onApiUrlChange,
+            label = { Text("URL шлюза API", fontSize = 12.sp) },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(10.dp)
+        )
+
+        Spacer(Modifier.height(8.dp))
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            FilterChip(
+                selected = apiMode == "mobile_api",
+                onClick = { onApiModeChange("mobile_api") },
+                label = { Text("Mobile API", fontSize = 12.sp) }
+            )
+            FilterChip(
+                selected = apiMode == "true_api",
+                onClick = { onApiModeChange("true_api") },
+                label = { Text("True API", fontSize = 12.sp) }
+            )
+        }
+
+        if (apiMode == "true_api") {
+            Spacer(Modifier.height(6.dp))
+            OutlinedTextField(
+                value = apiToken,
+                onValueChange = onApiTokenChange,
+                label = { Text("Bearer токен", fontSize = 12.sp) },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(10.dp)
+            )
+        }
+
+        Spacer(Modifier.height(8.dp))
+
+        Button(
+            onClick = onSaveApi,
+            shape = RoundedCornerShape(10.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Сохранить параметры API")
+        }
+
+        Spacer(Modifier.weight(1f))
+        Spacer(Modifier.height(20.dp))
+        HorizontalDivider()
+        Spacer(Modifier.height(12.dp))
+
+        // Подпись бренда и версия
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                text = "AOR Systems",
+                fontWeight = FontWeight.ExtraBold,
+                fontSize = 15.sp,
+                letterSpacing = 1.sp,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+            Text(
+                text = "Версия 3.0",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+@Composable
+private fun DrawerSectionTitle(text: String) {
+    Text(
+        text = text.uppercase(),
+        fontSize = 11.sp,
+        fontWeight = FontWeight.Bold,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.padding(bottom = 4.dp)
+    )
+}
+
+@Composable
+private fun DrawerSwitchRow(
+    title: String,
+    subtitle: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onCheckedChange(!checked) }
+            .padding(vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+            Text(text = title, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+            Text(text = subtitle, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Switch(checked = checked, onCheckedChange = onCheckedChange)
+    }
+}
+
+// ==================== ЗАМОК ОТ СЛУЧАЙНЫХ КАСАНИЙ ====================
+
+@Composable
+private fun ShelfLockOverlay(onUnlock: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.68f))
+            .pointerInput(Unit) {
+                detectTapGestures(
+                    onLongPress = { onUnlock() }
+                )
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        Surface(
+            shape = RoundedCornerShape(16.dp),
+            color = Color(0xFF131720),
+            border = BorderStroke(1.dp, Color(0xFF3B82F6)),
+            modifier = Modifier.padding(24.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Lock,
+                    contentDescription = null,
+                    tint = Color(0xFF3B82F6),
+                    modifier = Modifier.size(36.dp)
+                )
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    text = "Экран заблокирован от полки",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 16.sp,
+                    textAlign = TextAlign.Center
+                )
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = "Сканер и вибрация активны.\nУдерживайте палец на экране 1 сек, чтобы разблокировать.",
+                    color = Color(0xFF94A3B8),
+                    fontSize = 13.sp,
+                    textAlign = TextAlign.Center
+                )
+            }
+        }
+    }
+}
+
+// ==================== ДИАЛОГ РУЧНОГО ДОБАВЛЕНИЯ ====================
+
+@Composable
+private fun ManualAddItemDialog(
+    existingNames: List<String>,
+    onDismiss: () -> Unit,
+    onAdd: (name: String, expIso: String?, qty: Int) -> Unit
+) {
+    var name by remember { mutableStateOf("") }
+    var dateInput by remember { mutableStateOf(LocalDate.now().format(DateTimeFormatter.ofPattern("dd.MM.yyyy"))) }
+    var qtyInput by remember { mutableStateOf("1") }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Добавить вручную") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("Наименование товара") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                if (existingNames.isNotEmpty()) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        existingNames.take(2).forEach { suggestion ->
+                            SuggestionChip(
+                                onClick = { name = suggestion },
+                                label = { Text(suggestion.take(18), fontSize = 11.sp) }
+                            )
+                        }
+                    }
+                }
+                OutlinedTextField(
+                    value = dateInput,
+                    onValueChange = { dateInput = it },
+                    label = { Text("Срок годности (ДД.ММ.ГГГГ)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = qtyInput,
+                    onValueChange = { qtyInput = it.filter { ch -> ch.isDigit() } },
+                    label = { Text("Количество (шт.)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    val iso = parseRuToIso(dateInput)
+                    val qty = (qtyInput.toIntOrNull() ?: 1).coerceIn(1, 99)
+                    onAdd(name.trim(), iso, qty)
+                }
+            ) {
+                Text("Добавить", fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Отмена") }
+        }
+    )
+}
+
+// ==================== КАМЕРА CAMERAX С МАКРО 0.6X И ML KIT ====================
+
+@SuppressLint("UnsafeOptInUsageError")
+@Composable
+private fun CameraScannerView(
+    zoomPresetIndex: Int,
+    torchEnabled: Boolean,
+    fullFrameScan: Boolean,
+    onBarcodeScanned: (String) -> Unit
+) {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
+    var cameraRef by remember { mutableStateOf<Camera?>(null) }
+
+    val latestFullFrame by rememberUpdatedState(fullFrameScan)
+    val latestCallback by rememberUpdatedState(onBarcodeScanned)
+
+    // Управление фонариком
+    LaunchedEffect(cameraRef, torchEnabled) {
+        cameraRef?.cameraControl?.enableTorch(torchEnabled)
+    }
+
+    // Управление зумом (включая макро 0.6x через минимальный зум камеры)
+    LaunchedEffect(cameraRef, zoomPresetIndex) {
+        val cam = cameraRef ?: return@LaunchedEffect
+        val zoomState = cam.cameraInfo.zoomState.value ?: return@LaunchedEffect
+        val targetRatio = when (zoomPresetIndex) {
+            0 -> zoomState.minZoomRatio.coerceAtLeast(0.5f) // Ширик / Макро 0.6x
+            1 -> 1.0f.coerceIn(zoomState.minZoomRatio, zoomState.maxZoomRatio)
+            2 -> 2.0f.coerceIn(zoomState.minZoomRatio, zoomState.maxZoomRatio)
+            else -> 3.0f.coerceIn(zoomState.minZoomRatio, zoomState.maxZoomRatio)
+        }
+        cam.cameraControl.setZoomRatio(targetRatio)
+    }
+
+    DisposableEffect(Unit) {
+        onDispose { cameraExecutor.shutdown() }
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        AndroidView(
+            factory = { ctx ->
+                val previewView = PreviewView(ctx)
+                val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
+                cameraProviderFuture.addListener({
+                    val provider = cameraProviderFuture.get()
+                    val preview = Preview.Builder().build().also {
+                        it.setSurfaceProvider(previewView.surfaceProvider)
+                    }
+
+                    val options = BarcodeScannerOptions.Builder()
+                        .setBarcodeFormats(Barcode.FORMAT_DATA_MATRIX)
+                        .build()
+                    val scanner = BarcodeScanning.getClient(options)
+
+                    val analysis = ImageAnalysis.Builder()
+                        .setTargetResolution(Size(1280, 720))
+                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                        .build()
+
+                    analysis.setAnalyzer(cameraExecutor) { imageProxy: ImageProxy ->
+                        val mediaImage = imageProxy.image
+                        if (mediaImage != null) {
+                            if (!latestFullFrame) {
+                                // Обрезка центральной зоны для точного прицеливания в банки
+                                val w = mediaImage.width
+                                val h = mediaImage.height
+                                val cropSize = (minOf(w, h) * 0.56f).toInt()
+                                val left = (w - cropSize) / 2
+                                val top = (h - cropSize) / 2
+                                imageProxy.setCropRect(android.graphics.Rect(left, top, left + cropSize, top + cropSize))
+                            }
+                            val input = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
+                            scanner.process(input)
+                                .addOnSuccessListener { barcodes ->
+                                    for (b in barcodes) {
+                                        val raw = b.rawValue
+                                        if (!raw.isNullOrBlank()) {
+                                            latestCallback(raw)
+                                            break
+                                        }
+                                    }
+                                }
+                                .addOnCompleteListener { imageProxy.close() }
+                        } else {
+                            imageProxy.close()
+                        }
+                    }
+
+                    try {
+                        provider.unbindAll()
+                        cameraRef = provider.bindToLifecycle(
+                            lifecycleOwner,
+                            CameraSelector.DEFAULT_BACK_CAMERA,
+                            preview,
+                            analysis
+                        )
+                    } catch (_: Exception) {
+                    }
+                }, ContextCompat.getMainExecutor(ctx))
+                previewView
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+
+        // Визуальная рамка прицела (в режиме "Центр")
+        if (!fullFrameScan) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .offset(y = (-45).dp)
+                    .size(210.dp)
+                    .border(2.dp, Color(0xFF38BDF8).copy(alpha = 0.75f), RoundedCornerShape(16.dp))
+            )
+        }
+    }
+}
+
+// ==================== СЕТЕВОЙ ЗАПРОС К ШЛЮЗУ ====================
+
+private data class GatewayResult(
+    val expDate: String?,
+    val name: String?,
+    val status: String?,
+    val error: String?,
+    val shouldRetry: Boolean
+)
+
+private suspend fun fetchFromGateway(
+    endpoint: String,
+    mode: String,
+    token: String,
+    parsed: ParsedDataMatrix
+): GatewayResult = withContext(Dispatchers.IO) {
+    try {
+        val url = URL(endpoint)
+        val conn = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = 15000
+            readTimeout = 20000
+            doOutput = true
+            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            setRequestProperty("X-Api-Mode", mode)
+            if (token.isNotBlank()) {
+                setRequestProperty("X-Api-Token", token)
+            }
+        }
+
+        val payload = JSONObject().apply {
+            val arr = JSONArray()
+            arr.put(JSONObject().apply {
+                put("uniqueKey", parsed.uniqueKey)
+                put("gtin", parsed.gtin)
+                put("sn", parsed.sn)
+                put("cis", parsed.cis)
+                put("raw", parsed.raw)
+            })
+            put("items", arr)
+        }
+
+        conn.outputStream.use { os ->
+            os.write(payload.toString().toByteArray(StandardCharsets.UTF_8))
+        }
+
+        val code = conn.responseCode
+        if (code == 429 || code >= 500) {
+            return@withContext GatewayResult(null, null, null, "Сервер занят ($code)", shouldRetry = true)
+        }
+        if (code !in 200..299) {
+            return@withContext GatewayResult(null, null, null, "Ошибка шлюза HTTP $code", shouldRetry = false)
+        }
+
+        val respText = conn.inputStream.bufferedReader(StandardCharsets.UTF_8).use { it.readText() }
+        val json = JSONObject(respText)
+        val results = json.optJSONArray("results")
+        if (results == null || results.length() == 0) {
+            return@withContext GatewayResult(null, null, null, "Пустой ответ шлюза", shouldRetry = false)
+        }
+
+        val first = results.getJSONObject(0)
+        val err = if (first.isNull("error")) null else first.optString("error")
+        val retryFromCrpt = err != null && (err.contains("429") || err.contains("Таймаут"))
+
+        GatewayResult(
+            expDate = if (first.isNull("expDate")) null else first.optString("expDate"),
+            name = if (first.isNull("name")) null else first.optString("name"),
+            status = if (first.isNull("status")) null else first.optString("status"),
+            error = err,
+            shouldRetry = retryFromCrpt
+        )
+    } catch (e: Exception) {
+        GatewayResult(
+            expDate = null,
+            name = null,
+            status = null,
+            error = "Сбой сети: ${e.localizedMessage ?: "таймаут"}",
+            shouldRetry = true
+        )
+    }
+}
+
+// ==================== ФОРМАТИРОВАНИЕ ДАТ И ОТЧЁТОВ ====================
+
+private fun formatRuDate(iso: String?): String {
+    if (iso.isNullOrBlank()) return "—"
+    return try {
+        val d = LocalDate.parse(iso.take(10))
+        d.format(DateTimeFormatter.ofPattern("dd.MM.yyyy"))
+    } catch (_: Exception) {
+        iso
+    }
+}
+
+private fun parseRuToIso(ru: String): String? {
+    return try {
+        val d = LocalDate.parse(ru.trim(), DateTimeFormatter.ofPattern("dd.MM.yyyy"))
+        d.toString()
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private fun buildCsv(list: List<ScannedItem>, thresholdDate: LocalDate): String {
+    val sb = StringBuilder()
+    sb.appendLine("Наименование;GTIN;Серийный номер;Срок годности;Статус;Порог проверки")
+    val thrStr = thresholdDate.format(DateTimeFormatter.ofPattern("dd.MM.yyyy"))
+    for (it in list) {
+        val cleanName = (it.name ?: "Не определено").replace(";", ",")
+        val expStr = formatRuDate(it.expDate)
+        val statusStr = when {
+            it.status == "RETIRED" -> "ВЫБЫЛ"
+            it.expDate != null && !LocalDate.parse(it.expDate.take(10)).isAfter(thresholdDate) -> "ПРОСРОЧКА"
+            it.expDate != null -> "ГОДЕН"
+            else -> it.infoMsg ?: "БЕЗ ДАТЫ"
+        }
+        sb.appendLine("$cleanName;\"${it.gtin}\";\"${it.sn}\";$expStr;$statusStr;$thrStr")
+    }
+    return sb.toString()
+}
+
+private fun buildMessengerSummary(
+    list: List<ScannedItem>,
+    thresholdDate: LocalDate,
+    isExpiredFn: (ScannedItem) -> Boolean
+): String {
+    val nowStr = LocalDateTime.now().format(DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm"))
+    val thrStr = thresholdDate.format(DateTimeFormatter.ofPattern("dd.MM.yyyy"))
+    val expired = list.filter(isExpiredFn)
+
+    val sb = StringBuilder()
+    sb.appendLine("📋 Сводка ревизии (AOR Systems)")
+    sb.appendLine("Дата: $nowStr | Порог: до $thrStr")
+    sb.appendLine("Всего проверено: ${list.size} шт. | На списание: ${expired.size} шт.")
+    sb.appendLine()
+
+    if (expired.isEmpty()) {
+        sb.appendLine("✅ Просроченных позиций не обнаружено.")
+    } else {
+        sb.appendLine("🚨 Позиции на списание:")
+        val grouped = expired.groupBy { (it.name ?: "GTIN ${it.gtin}") to formatRuDate(it.expDate) }
+        var idx = 1
+        for ((key, group) in grouped) {
+            sb.appendLine("$idx. ${key.first} — ${group.size} шт. (до ${key.second})")
+            idx++
+        }
+    }
+    return sb.toString()
 }
