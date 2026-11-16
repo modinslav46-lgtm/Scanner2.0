@@ -48,6 +48,7 @@ import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
@@ -199,7 +200,7 @@ class AppStorage(context: Context) {
     private val prefs = context.getSharedPreferences("aor_cz_scanner_v3", Context.MODE_PRIVATE)
 
     var apiUrl: String
-        get() = prefs.getString("api_url", "https://functions.yandexcloud.net/ВАШ_ID_ФУНКЦИИ") ?: ""
+        get() = prefs.getString("api_url", "") ?: ""
         set(v) = prefs.edit().putString("api_url", v.trim()).apply()
 
     var apiMode: String
@@ -305,11 +306,14 @@ class SwipeHostFrameLayout(context: Context) : FrameLayout(context) {
     var canSwipeLeftDrawer: () -> Boolean = { false }
     var canSwipeRightList: () -> Boolean = { false }
     var isDrawerOpened: () -> Boolean = { false }
+    var isRightPanelOpened: () -> Boolean = { false }
     var getDrawerWidthPx: () -> Float = { 800f }
+    var getListWidthPx: () -> Float = { 1080f }
 
     var onDrawerDragProgress: (progress: Float) -> Unit = {}
     var onDrawerDragRelease: (velocityX: Float, currentProgress: Float) -> Unit = { _, _ -> }
-    var onSwipeOpenList: () -> Unit = {}
+    var onRightPanelDragProgress: (progress: Float) -> Unit = {}
+    var onRightPanelDragRelease: (velocityX: Float, currentProgress: Float) -> Unit = { _, _ -> }
 
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
     private var startX = 0f
@@ -317,8 +321,8 @@ class SwipeHostFrameLayout(context: Context) : FrameLayout(context) {
     private var lastX = 0f
     private var lastMoveTime = 0L
     private var velocityX = 0f
-    private var dragMode = 0 // 0=none, 1=drawerDrag, 2=listSwipe
-    private var baseDrawerProgress = 0f
+    private var dragMode = 0 // 0=none, 1=drawerDrag, 2=rightPanelDrag
+    private var baseProgress = 0f
 
     override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
         when (ev.actionMasked) {
@@ -329,7 +333,6 @@ class SwipeHostFrameLayout(context: Context) : FrameLayout(context) {
                 lastMoveTime = ev.eventTime
                 velocityX = 0f
                 dragMode = 0
-                baseDrawerProgress = if (isDrawerOpened()) 1f else 0f
             }
             MotionEvent.ACTION_MOVE -> {
                 val dx = ev.x - startX
@@ -337,12 +340,19 @@ class SwipeHostFrameLayout(context: Context) : FrameLayout(context) {
                 if (abs(dx) > touchSlop && abs(dx) > abs(dy) * 1.2f) {
                     if (isDrawerOpened()) {
                         dragMode = 1
+                        baseProgress = 1f
+                        return true
+                    } else if (isRightPanelOpened()) {
+                        dragMode = 2
+                        baseProgress = 1f
                         return true
                     } else if (dx > 0 && canSwipeLeftDrawer()) {
                         dragMode = 1
+                        baseProgress = 0f
                         return true
                     } else if (dx < 0 && canSwipeRightList()) {
                         dragMode = 2
+                        baseProgress = 0f
                         return true
                     }
                 }
@@ -364,10 +374,13 @@ class SwipeHostFrameLayout(context: Context) : FrameLayout(context) {
                 val dx = ev.x - startX
                 if (dragMode == 1) {
                     val w = getDrawerWidthPx().coerceAtLeast(1f)
-                    val progress = (baseDrawerProgress + dx / w).coerceIn(0f, 1f)
+                    val progress = (baseProgress + dx / w).coerceIn(0f, 1f)
                     onDrawerDragProgress(progress)
                     return true
                 } else if (dragMode == 2) {
+                    val w = getListWidthPx().coerceAtLeast(1f)
+                    val progress = (baseProgress - dx / w).coerceIn(0f, 1f)
+                    onRightPanelDragProgress(progress)
                     return true
                 }
             }
@@ -375,14 +388,14 @@ class SwipeHostFrameLayout(context: Context) : FrameLayout(context) {
                 val dx = ev.x - startX
                 if (dragMode == 1) {
                     val w = getDrawerWidthPx().coerceAtLeast(1f)
-                    val progress = (baseDrawerProgress + dx / w).coerceIn(0f, 1f)
+                    val progress = (baseProgress + dx / w).coerceIn(0f, 1f)
                     onDrawerDragRelease(velocityX, progress)
                     dragMode = 0
                     return true
                 } else if (dragMode == 2) {
-                    if (dx < -touchSlop * 3f || velocityX < -600f) {
-                        onSwipeOpenList()
-                    }
+                    val w = getListWidthPx().coerceAtLeast(1f)
+                    val progress = (baseProgress - dx / w).coerceIn(0f, 1f)
+                    onRightPanelDragRelease(velocityX, progress)
                     dragMode = 0
                     return true
                 }
@@ -398,7 +411,7 @@ class SwipeHostFrameLayout(context: Context) : FrameLayout(context) {
 class MainActivity : ComponentActivity() {
 
     companion object {
-        const val APP_VERSION = "3.1"
+        const val APP_VERSION = "3.1.1"
     }
 
     private lateinit var storage: AppStorage
@@ -440,6 +453,7 @@ class MainActivity : ComponentActivity() {
 
     // Основные View
     private lateinit var rootFrame: SwipeHostFrameLayout
+    private lateinit var containerMain: FrameLayout
     private lateinit var headerContainer: LinearLayout
     private lateinit var btnMenu: TextView
     private lateinit var tvThresholdBadge: TextView
@@ -473,7 +487,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var fifoFillBanner: View
     private lateinit var tvFifoLabelBanner: TextView
 
-    // Экран списка / ТСД
+    // Экран списка / ТСД (Правая панель)
     private lateinit var listSection: LinearLayout
     private lateinit var phoneListTopBar: LinearLayout
     private lateinit var tvPhoneListTitle: TextView
@@ -557,6 +571,7 @@ class MainActivity : ComponentActivity() {
 
         buildUi()
         setupSystemInsets()
+        setupBackHandler()
         registerScannerBroadcast()
         startApiWorker()
         refreshAllUi()
@@ -586,6 +601,22 @@ class MainActivity : ComponentActivity() {
         uiScope.cancel()
     }
 
+    // ==================== СИСТЕМНАЯ КНОПКА НАЗАД ====================
+
+    private fun setupBackHandler() {
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (isDrawerOpen) {
+                    closeDrawer()
+                } else if (showListScreen && !storage.tsdMode) {
+                    closeRightPanel()
+                } else {
+                    finish()
+                }
+            }
+        })
+    }
+
     // ==================== СИСТЕМНЫЕ ОТСТУПЫ ====================
 
     private fun setupSystemInsets() {
@@ -602,7 +633,7 @@ class MainActivity : ComponentActivity() {
     private fun applySystemInsets() {
         headerContainer.setPadding(dp(8), sysTopInset + dp(8), dp(8), dp(8))
         bottomHud.setPadding(dp(10), dp(10), dp(10), sysBottomInset + dp(12))
-        listSection.setPadding(dp(10), dp(6), dp(10), sysBottomInset + dp(10))
+        listSection.setPadding(dp(10), sysTopInset + dp(6), dp(10), sysBottomInset + dp(10))
         drawerContentCol?.setPadding(dp(16), sysTopInset + dp(18), dp(16), sysBottomInset + dp(24))
     }
 
@@ -702,10 +733,12 @@ class MainActivity : ComponentActivity() {
     private fun buildUi() {
         rootFrame = SwipeHostFrameLayout(this).apply {
             layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-            canSwipeLeftDrawer = { !isSwipesLocked && !isDrawerOpen }
+            canSwipeLeftDrawer = { !isSwipesLocked && !isDrawerOpen && !showListScreen }
             canSwipeRightList = { !isSwipesLocked && !isDrawerOpen && !storage.tsdMode && !showListScreen }
             isDrawerOpened = { isDrawerOpen }
+            isRightPanelOpened = { showListScreen && !storage.tsdMode }
             getDrawerWidthPx = { dp(305).toFloat() }
+            getListWidthPx = { resources.displayMetrics.widthPixels.toFloat() }
             onDrawerDragProgress = { progress ->
                 val w = dp(305).toFloat()
                 if (drawerPanel.visibility != View.VISIBLE) {
@@ -722,10 +755,24 @@ class MainActivity : ComponentActivity() {
                     closeDrawer()
                 }
             }
-            onSwipeOpenList = {
-                showListScreen = true
-                refreshAllUi()
+            onRightPanelDragProgress = { progress ->
+                val w = resources.displayMetrics.widthPixels.toFloat()
+                if (listSection.visibility != View.VISIBLE) {
+                    listSection.visibility = View.VISIBLE
+                }
+                listSection.translationX = w * (1f - progress)
             }
+            onRightPanelDragRelease = { vx, progress ->
+                if (vx < -500f || (vx <= 300f && progress >= 0.45f)) {
+                    openRightPanel()
+                } else {
+                    closeRightPanel()
+                }
+            }
+        }
+
+        containerMain = FrameLayout(this).apply {
+            layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
         }
 
         val mainColumn = LinearLayout(this).apply {
@@ -836,8 +883,7 @@ class MainActivity : ComponentActivity() {
             setPadding(dp(12), dp(10), dp(12), dp(10))
             setOnClickListener {
                 if (!storage.tsdMode) {
-                    showListScreen = true
-                    refreshAllUi()
+                    openRightPanel()
                 }
             }
         }
@@ -902,7 +948,7 @@ class MainActivity : ComponentActivity() {
         fifoContainerBanner.addView(tvFifoLabelBanner)
         activeBannerCard.addView(fifoContainerBanner)
 
-        // ===== 3. ОБЛАСТЬ КАМЕРЫ (РЕЖИМ ТЕЛЕФОНА) =====
+        // ===== 3. ОБЛАСТЬ КАМЕРА (РЕЖИМ ТЕЛЕФОНА) =====
         cameraSection = FrameLayout(this).apply {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
         }
@@ -912,7 +958,6 @@ class MainActivity : ComponentActivity() {
         }
         cameraSection.addView(previewView)
 
-        // Контейнер-видоискатель строго над нижней панелью (для симметрии прицела)
         val viewfinderArea = FrameLayout(this).apply {
             layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
         }
@@ -939,7 +984,6 @@ class MainActivity : ComponentActivity() {
         viewfinderArea.addView(focusRingView)
         cameraSection.addView(viewfinderArea)
 
-        // Точечный фокус по касанию экрана камеры (Tap-to-Focus)
         val tapDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onSingleTapUp(e: MotionEvent): Boolean {
                 triggerTapToFocus(e.x, e.y)
@@ -969,7 +1013,6 @@ class MainActivity : ComponentActivity() {
             layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM)
         }
 
-        // Автоматическая синхронизация нижнего отступа видоискателя с высотой нижней панели
         bottomHud.addOnLayoutChangeListener { _, _, top, _, bottom, _, _, _, _ ->
             val hudH = bottom - top
             val lp = viewfinderArea.layoutParams as FrameLayout.LayoutParams
@@ -988,18 +1031,15 @@ class MainActivity : ComponentActivity() {
 
         tvStatAll = makeStatChip {
             selectedTab = FilterTab.ALL
-            showListScreen = true
-            refreshAllUi()
+            openRightPanel()
         }
         tvStatExpired = makeStatChip {
             selectedTab = FilterTab.EXPIRED
-            showListScreen = true
-            refreshAllUi()
+            openRightPanel()
         }
         tvStatNoDate = makeStatChip {
             selectedTab = FilterTab.NO_DATE
-            showListScreen = true
-            refreshAllUi()
+            openRightPanel()
         }
         statsRow.addView(tvStatAll, statWeightParams(6))
         statsRow.addView(tvStatExpired, statWeightParams(6))
@@ -1011,11 +1051,13 @@ class MainActivity : ComponentActivity() {
         cameraSection.addView(bottomHud)
         mainColumn.addView(cameraSection)
 
-        // ===== 4. ОБЛАСТЬ СПИСКА (ТСД И ПРОСМОТР НА ТЕЛЕФОНЕ) =====
+        containerMain.addView(mainColumn)
+
+        // ===== 4. ПРАВАЯ ПАНЕЛЬ: ЭКРАН СПИСКА / ТСД (СТРОГО ПОВЕРХ КАМЕРЫ ДЛЯ СВАЙПОВ) =====
         listSection = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(10), dp(6), dp(10), dp(10))
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+            setPadding(dp(10), sysTopInset + dp(6), dp(10), dp(10))
+            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
             visibility = View.GONE
         }
 
@@ -1025,8 +1067,7 @@ class MainActivity : ComponentActivity() {
             setPadding(0, dp(4), 0, dp(8))
         }
         val btnBackCamera = makeHeaderChip("← К камере") {
-            showListScreen = false
-            refreshAllUi()
+            closeRightPanel()
         }
         tvPhoneListTitle = TextView(this).apply {
             setTypeface(null, Typeface.BOLD)
@@ -1041,7 +1082,6 @@ class MainActivity : ComponentActivity() {
         phoneListTopBar.addView(btnClearList)
         listSection.addView(phoneListTopBar)
 
-        // Поле автозахвата скана для режима ТСД (без вызова экранной клавиатуры)
         tsdInputContainer = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -1218,11 +1258,11 @@ class MainActivity : ComponentActivity() {
         exportRow.addView(btnCopySummary)
         exportRow.addView(btnExportAll)
         listSection.addView(exportRow)
-        mainColumn.addView(listSection)
 
-        rootFrame.addView(mainColumn)
+        containerMain.addView(listSection)
+        rootFrame.addView(containerMain)
 
-        // ===== 5. МЯГКАЯ ЦВЕТОВАЯ ПОДСВЕТКА КОНТУРА ПРИ СКАНЕ =====
+        // ===== 5. МЯГКАЯ ЦВЕТОВАЯ ПОДСВЕТКА КОНТУРА =====
         flashOverlay = View(this).apply {
             layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
             visibility = View.GONE
@@ -1250,6 +1290,36 @@ class MainActivity : ComponentActivity() {
         rootFrame.addView(drawerPanel)
 
         setContentView(rootFrame)
+    }
+
+    private fun openRightPanel() {
+        showListScreen = true
+        val w = resources.displayMetrics.widthPixels.toFloat()
+        listSection.visibility = View.VISIBLE
+        listSection.animate().cancel()
+        listSection.animate().translationX(0f).alpha(1f).setDuration(220L).start()
+        refreshAllUi()
+    }
+
+    private fun closeRightPanel() {
+        showListScreen = false
+        val w = resources.displayMetrics.widthPixels.toFloat()
+        listSection.animate().cancel()
+        listSection.animate().translationX(w).alpha(0.8f).setDuration(200L).withEndAction {
+            if (!showListScreen) {
+                listSection.visibility = View.GONE
+                // Сброс поиска при возврате к камере
+                if (searchQuery.isNotEmpty()) {
+                    searchQuery = ""
+                    etSearch.setText("")
+                }
+            }
+        }.start()
+
+        // Убрать экранную клавиатуру, если она открыта
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+        imm?.hideSoftInputFromWindow(etSearch.windowToken, 0)
+        refreshAllUi()
     }
 
     private fun buildDrawerContent() {
@@ -1282,8 +1352,12 @@ class MainActivity : ComponentActivity() {
                 torchEnabled = false
                 showListScreen = false
                 cameraProvider?.unbindAll()
+                listSection.translationX = 0f
+                listSection.alpha = 1f
+                listSection.visibility = View.VISIBLE
                 focusTsdCaptureField()
             } else {
+                listSection.visibility = View.GONE
                 ensureCameraStarted()
             }
             refreshAllUi()
@@ -1297,8 +1371,7 @@ class MainActivity : ComponentActivity() {
             p = p
         ) { enabled ->
             storage.darkTheme = enabled
-            buildDrawerContent()
-            refreshAllUi()
+            animateThemeCrossfade()
         })
 
         col.addView(makeDrawerSwitch(
@@ -1369,6 +1442,13 @@ class MainActivity : ComponentActivity() {
         col.addView(btnManual)
 
         col.addView(makeDrawerSectionHeader("Настройки API / Шлюз ЧЗ", p))
+
+        // Группа ввода API URL
+        val apiInputRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
         val etApiUrl = EditText(this).apply {
             setText(storage.apiUrl)
             hint = "URL шлюза API"
@@ -1378,8 +1458,29 @@ class MainActivity : ComponentActivity() {
             isSingleLine = true
             setPadding(dp(10), dp(9), dp(10), dp(9))
             background = roundedBg(p.surfaceAlt, 8, p.border, 1)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = dp(6)
+            }
         }
-        col.addView(etApiUrl)
+        val btnPasteUrl = TextView(this).apply {
+            text = "📋 Вставить"
+            textSize = spSize(12f)
+            setTypeface(null, Typeface.BOLD)
+            setPadding(dp(8), dp(9), dp(8), dp(9))
+            setTextColor(p.primary)
+            background = roundedBg(p.surfaceAlt, 8, p.border, 1)
+            setOnClickListener {
+                val clip = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                val pasteText = clip?.primaryClip?.getItemAt(0)?.text?.toString() ?: ""
+                if (pasteText.isNotBlank()) {
+                    etApiUrl.setText(pasteText)
+                    Toast.makeText(this@MainActivity, "URL вставлен", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        apiInputRow.addView(etApiUrl)
+        apiInputRow.addView(btnPasteUrl)
+        col.addView(apiInputRow)
 
         val modeRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -1390,6 +1491,15 @@ class MainActivity : ComponentActivity() {
         var draftMode = storage.apiMode
         val btnMobileApi = TextView(this)
         val btnTrueApi = TextView(this)
+
+        // Группа ввода токена True API
+        val tokenRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(8)
+            }
+        }
         val etToken = EditText(this).apply {
             setText(storage.apiToken)
             hint = "Bearer токен True API"
@@ -1399,18 +1509,35 @@ class MainActivity : ComponentActivity() {
             isSingleLine = true
             setPadding(dp(10), dp(9), dp(10), dp(9))
             background = roundedBg(p.surfaceAlt, 8, p.border, 1)
-            visibility = if (draftMode == "true_api") View.VISIBLE else View.GONE
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                topMargin = dp(8)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = dp(6)
             }
         }
+        val btnPasteToken = TextView(this).apply {
+            text = "📋 Вставить"
+            textSize = spSize(12f)
+            setTypeface(null, Typeface.BOLD)
+            setPadding(dp(8), dp(9), dp(8), dp(9))
+            setTextColor(p.primary)
+            background = roundedBg(p.surfaceAlt, 8, p.border, 1)
+            setOnClickListener {
+                val clip = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                val pasteText = clip?.primaryClip?.getItemAt(0)?.text?.toString() ?: ""
+                if (pasteText.isNotBlank()) {
+                    etToken.setText(pasteText)
+                    Toast.makeText(this@MainActivity, "Токен вставлен", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        tokenRow.addView(etToken)
+        tokenRow.addView(btnPasteToken)
 
         fun updateModeChips() {
             btnMobileApi.background = roundedBg(if (draftMode == "mobile_api") p.primary else p.surfaceAlt, 8)
             btnMobileApi.setTextColor(if (draftMode == "mobile_api") Color.WHITE else p.textPrimary)
             btnTrueApi.background = roundedBg(if (draftMode == "true_api") p.primary else p.surfaceAlt, 8)
             btnTrueApi.setTextColor(if (draftMode == "true_api") Color.WHITE else p.textPrimary)
-            etToken.visibility = if (draftMode == "true_api") View.VISIBLE else View.GONE
+            tokenRow.visibility = if (draftMode == "true_api") View.VISIBLE else View.GONE
         }
 
         btnMobileApi.apply {
@@ -1435,7 +1562,7 @@ class MainActivity : ComponentActivity() {
         modeRow.addView(btnMobileApi)
         modeRow.addView(btnTrueApi)
         col.addView(modeRow)
-        col.addView(etToken)
+        col.addView(tokenRow)
 
         val btnSaveApi = TextView(this).apply {
             text = "Сохранить параметры API"
@@ -1453,6 +1580,11 @@ class MainActivity : ComponentActivity() {
                 storage.apiMode = draftMode
                 storage.apiToken = etToken.text.toString()
                 Toast.makeText(this@MainActivity, "Настройки шлюза сохранены", Toast.LENGTH_SHORT).show()
+                // Убираем фокус и закрываем клавиатуру
+                etApiUrl.clearFocus()
+                etToken.clearFocus()
+                val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+                imm?.hideSoftInputFromWindow(it.windowToken, 0)
             }
         }
         col.addView(btnSaveApi)
@@ -1480,7 +1612,7 @@ class MainActivity : ComponentActivity() {
             gravity = Gravity.CENTER
         })
         brandBox.addView(TextView(this).apply {
-            text = "Версия $APP_VERSION • Что нового ▸"
+            text = "Версия $APP_VERSION • Список изменений ▸"
             textSize = spSize(12f)
             setTextColor(p.primary)
             gravity = Gravity.CENTER
@@ -1491,22 +1623,48 @@ class MainActivity : ComponentActivity() {
         drawerPanel.addView(col)
     }
 
+    private fun animateThemeCrossfade() {
+        val overlay = View(this).apply {
+            setBackgroundColor(palette().bg)
+            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            alpha = 1f
+        }
+        rootFrame.addView(overlay)
+
+        buildDrawerContent()
+        refreshAllUi()
+
+        overlay.animate()
+            .alpha(0f)
+            .setDuration(450L)
+            .withEndAction { rootFrame.removeView(overlay) }
+            .start()
+    }
+
     private fun openDrawer() {
         isDrawerOpen = true
         drawerScrim.visibility = View.VISIBLE
         drawerPanel.visibility = View.VISIBLE
-        drawerScrim.animate().alpha(1f).setDuration(200).start()
-        drawerPanel.animate().translationX(0f).setDuration(200).start()
+        drawerScrim.animate().cancel()
+        drawerPanel.animate().cancel()
+        drawerScrim.animate().alpha(1f).setDuration(220L).start()
+        drawerPanel.animate().translationX(0f).setDuration(220L).start()
     }
 
     private fun closeDrawer() {
         isDrawerOpen = false
-        drawerScrim.animate().alpha(0f).setDuration(180).withEndAction {
+        drawerScrim.animate().cancel()
+        drawerPanel.animate().cancel()
+        drawerScrim.animate().alpha(0f).setDuration(180L).withEndAction {
             if (!isDrawerOpen) drawerScrim.visibility = View.GONE
         }.start()
-        drawerPanel.animate().translationX(-dp(305).toFloat()).setDuration(180).withEndAction {
+        drawerPanel.animate().translationX(-dp(305).toFloat()).setDuration(180L).withEndAction {
             if (!isDrawerOpen) drawerPanel.visibility = View.GONE
         }.start()
+
+        // Убрать клавиатуру при сворачивании шторки
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+        imm?.hideSoftInputFromWindow(drawerPanel.windowToken, 0)
     }
 
     private fun focusTsdCaptureField() {
@@ -1617,7 +1775,6 @@ class MainActivity : ComponentActivity() {
         rootFrame.setBackgroundColor(p.bg)
         headerContainer.setBackgroundColor(p.surface)
 
-        // Видимость кнопки меню в светлой и тёмной темах
         btnMenu.setTextColor(p.textPrimary)
 
         val dateStr = formatShortDayMonth(thresholdMillis())
@@ -1645,7 +1802,6 @@ class MainActivity : ComponentActivity() {
         btnTorch.background = roundedBg(if (torchEnabled) Color.parseColor("#F59E0B") else p.surfaceAlt, 8)
         btnTorch.setTextColor(if (torchEnabled) Color.BLACK else p.textPrimary)
 
-        // Кнопка замка свайпов
         btnLock.text = if (isSwipesLocked) "🔒" else "🔓"
         btnLock.background = roundedBg(if (isSwipesLocked) p.primary else p.surfaceAlt, 8)
         btnLock.setTextColor(if (isSwipesLocked) Color.WHITE else p.textPrimary)
@@ -1662,7 +1818,6 @@ class MainActivity : ComponentActivity() {
 
         if (tsd) {
             cameraSection.visibility = View.GONE
-            listSection.visibility = View.VISIBLE
             phoneListTopBar.visibility = View.GONE
             tsdInputContainer.visibility = View.VISIBLE
             tsdInputContainer.background = roundedBg(p.surface, 10, Color.parseColor("#10B981"), 1)
@@ -1671,22 +1826,24 @@ class MainActivity : ComponentActivity() {
             etTsdScanCapture.textSize = spSize(13f)
             bannerSlotTsd.visibility = View.VISIBLE
             attachBannerCardTo(bannerSlotTsd)
+            listSection.visibility = View.VISIBLE
+            listSection.translationX = 0f
             focusTsdCaptureField()
         } else if (showListScreen) {
             cameraSection.visibility = View.GONE
-            listSection.visibility = View.VISIBLE
             phoneListTopBar.visibility = View.VISIBLE
             tsdInputContainer.visibility = View.GONE
             bannerSlotTsd.visibility = View.GONE
             tvPhoneListTitle.text = "Отсканировано: ${items.size}"
             tvPhoneListTitle.textSize = spSize(15f)
             tvPhoneListTitle.setTextColor(p.textPrimary)
+            listSection.visibility = View.VISIBLE
         } else {
             cameraSection.visibility = View.VISIBLE
-            listSection.visibility = View.GONE
             tsdInputContainer.visibility = View.GONE
             bottomHud.setBackgroundColor(Color.argb(235, Color.red(p.bg), Color.green(p.bg), Color.blue(p.bg)))
             attachBannerCardTo(bannerSlotCamera)
+            listSection.visibility = View.GONE
         }
 
         val expiredCount = items.count { isItemExpired(it) }
@@ -1772,7 +1929,6 @@ class MainActivity : ComponentActivity() {
 
         activeBannerCard.background = roundedBg(p.surface, 12, borderColor, 2)
 
-        // Срок годности теперь сразу возле статуса
         val expFormatted = formatRuDate(item.expDate)
         tvBannerStatus.text = when {
             item.isLoading -> "⏳ Запрос в Честный ЗНАК..."
@@ -1793,7 +1949,6 @@ class MainActivity : ComponentActivity() {
         tvBannerName.setTextColor(p.textPrimary)
         tvBannerName.textSize = spSize(if (large) 16f else 14f)
 
-        // Нижняя строка под названием — Дата производства (или техническая информация, если даты нет)
         when {
             !item.prodDate.isNullOrBlank() -> {
                 tvBannerProdDate.visibility = View.VISIBLE
@@ -2184,7 +2339,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Мягкое плавное свечение контура экрана вместо резкой вспышки
     private fun showSoftContourPulse(color: Int) {
         val gd = GradientDrawable().apply {
             shape = GradientDrawable.RECTANGLE
@@ -2228,7 +2382,6 @@ class MainActivity : ComponentActivity() {
             .build()
         cam.cameraControl.startFocusAndMetering(action)
 
-        // Визуальное кольцо фокуса в точке нажатия
         val ringHalf = dp(32)
         focusRingView.animate().cancel()
         val lp = focusRingView.layoutParams as FrameLayout.LayoutParams
@@ -2331,23 +2484,35 @@ class MainActivity : ComponentActivity() {
         cam.cameraControl.setZoomRatio(target)
     }
 
-    // ==================== ДИАЛОГИ (СБРОС, РУЧНОЙ ВВОД, CHANGELOG) ====================
+    // ==================== ДИАЛОГИ (CHANGELOG, СБРОС, РУЧНОЙ ВВОД) ====================
 
     private fun showChangelogDialog() {
         val notes = """
-            Версия $APP_VERSION (AOR Systems™)
+            Хронология ветки v3.1 (AOR Systems™)
 
-            • Срок годности перенесён в строку статуса («Годен / Просрочка: до ...»), а под названием отображается дата производства.
-            • Добавлен точечный автофокус по нажатию на экран камеры (Tap-to-Focus).
-            • Прицел камеры автоматически выравнивается по центру свободной области над нижней карточкой.
-            • Кнопка замка (🔒 / 🔓) теперь блокирует случайные свайпы в узких полках, оставляя нажатия и фокус активными.
-            • Добавлено плавное выдвижение левой шторки пальцем и открытие списка свайпом справа налево (в режиме смартфона).
-            • В режиме ТСД добавлено поле автозахвата кодов с постоянным фокусом без всплывающей клавиатуры.
-            • Добавлен отдельный переключатель вибрации, исправлена видимость иконки меню в светлой теме и смягчена световая индикация контура.
+            • v$APP_VERSION:
+              - Обработана аппаратная кнопка «Назад» (закрывает шторки и списки, сбрасывает фокусы поиска).
+              - Перепроверены JSON-ключи шлюза ЧЗ — Дата производства теперь определяется и выводится под названием.
+              - Правый список позиций теперь плавно выезжает справа и поддерживает жесты (свайп от правого края).
+              - Адаптация под виртуальную клавиатуру: поля ввода API больше не перекрываются.
+              - Кнопки «📋 Вставить» около полей ввода API.
+              - Пустые API-строки по умолчанию.
+              - Сглаженный кроссфейд-переход при смене тёмной/светлой темы.
+              - Автоматический сброс поисковой строки при возврате к камере.
+            
+            • v3.1:
+              - Дата окончания срока перенесена наверх к статусу («Годен / Просрочка до ДД.ММ.ГГГГ»).
+              - Точечный автофокус по тапу на экран (Tap-to-Focus) с визуальным кольцом.
+              - Симметричная центровка прицела камеры над нижней информационной панелью.
+              - Повышена безопасность: замок 🔒 блокирует только жесты/свайпы, сохраняя доступ к фокусу и кнопкам.
+              - Боковая шторка настроек теперь плавно перетягивается пальцем.
+              - Бесшовный режим ТСД: скрытая строка автозахвата кодов без вызова клавиатуры.
+              - Тумблер виброотклика вынесен отдельно.
+              - Версия подпись у логотипа в левом меню стала полностью интерактивной.
         """.trimIndent()
 
         AlertDialog.Builder(this)
-            .setTitle("Список изменений • v$APP_VERSION")
+            .setTitle("Список изменений ветки 3.1")
             .setMessage(notes)
             .setPositiveButton("Понятно", null)
             .show()
@@ -2435,6 +2600,9 @@ class MainActivity : ComponentActivity() {
         token: String,
         parsed: ParsedDataMatrix
     ): GatewayResult = withContext(Dispatchers.IO) {
+        if (endpoint.isBlank()) {
+            return@withContext GatewayResult(null, null, null, null, "Шлюз API не настроен", shouldRetry = false)
+        }
         try {
             val url = URL(endpoint)
             val conn = (url.openConnection() as HttpURLConnection).apply {
