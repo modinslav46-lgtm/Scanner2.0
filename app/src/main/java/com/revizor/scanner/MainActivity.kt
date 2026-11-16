@@ -34,7 +34,10 @@ import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
 import android.widget.BaseAdapter
 import android.widget.EditText
 import android.widget.FrameLayout
@@ -48,6 +51,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
@@ -80,6 +84,7 @@ import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 import kotlin.random.Random
 
@@ -91,7 +96,8 @@ data class ScannedItem(
     val sn: String,
     val raw: String,
     val name: String? = null,
-    val expDate: String? = null, // YYYY-MM-DD
+    val expDate: String? = null,  // YYYY-MM-DD
+    val prodDate: String? = null, // YYYY-MM-DD
     val status: String? = null,
     val infoMsg: String? = null,
     val isLoading: Boolean = true,
@@ -131,6 +137,7 @@ sealed class ListRowEntry {
 
 data class GatewayResult(
     val expDate: String?,
+    val prodDate: String?,
     val name: String?,
     val status: String?,
     val error: String?,
@@ -207,6 +214,10 @@ class AppStorage(context: Context) {
         get() = prefs.getBoolean("sound_enabled", true)
         set(v) = prefs.edit().putBoolean("sound_enabled", v).apply()
 
+    var vibrationEnabled: Boolean
+        get() = prefs.getBoolean("vibration_enabled", true)
+        set(v) = prefs.edit().putBoolean("vibration_enabled", v).apply()
+
     var tsdMode: Boolean
         get() = prefs.getBoolean("tsd_mode", false)
         set(v) = prefs.edit().putBoolean("tsd_mode", v).apply()
@@ -245,6 +256,7 @@ class AppStorage(context: Context) {
                 put("raw", it.raw)
                 put("name", it.name ?: JSONObject.NULL)
                 put("expDate", it.expDate ?: JSONObject.NULL)
+                put("prodDate", it.prodDate ?: JSONObject.NULL)
                 put("status", it.status ?: JSONObject.NULL)
                 put("infoMsg", it.infoMsg ?: JSONObject.NULL)
                 put("isLoading", false)
@@ -271,6 +283,7 @@ class AppStorage(context: Context) {
                         raw = o.optString("raw", ""),
                         name = if (o.isNull("name")) null else o.getString("name"),
                         expDate = if (o.isNull("expDate")) null else o.getString("expDate"),
+                        prodDate = if (o.isNull("prodDate")) null else o.getString("prodDate"),
                         status = if (o.isNull("status")) null else o.getString("status"),
                         infoMsg = if (o.isNull("infoMsg")) null else o.getString("infoMsg"),
                         isLoading = false,
@@ -286,9 +299,107 @@ class AppStorage(context: Context) {
     }
 }
 
+// ==================== КОНТЕЙНЕР С ИНТЕРАКТИВНЫМИ СВАЙПАМИ ====================
+
+class SwipeHostFrameLayout(context: Context) : FrameLayout(context) {
+    var canSwipeLeftDrawer: () -> Boolean = { false }
+    var canSwipeRightList: () -> Boolean = { false }
+    var isDrawerOpened: () -> Boolean = { false }
+    var getDrawerWidthPx: () -> Float = { 800f }
+
+    var onDrawerDragProgress: (progress: Float) -> Unit = {}
+    var onDrawerDragRelease: (velocityX: Float, currentProgress: Float) -> Unit = { _, _ -> }
+    var onSwipeOpenList: () -> Unit = {}
+
+    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
+    private var startX = 0f
+    private var startY = 0f
+    private var lastX = 0f
+    private var lastMoveTime = 0L
+    private var velocityX = 0f
+    private var dragMode = 0 // 0=none, 1=drawerDrag, 2=listSwipe
+    private var baseDrawerProgress = 0f
+
+    override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                startX = ev.x
+                startY = ev.y
+                lastX = ev.x
+                lastMoveTime = ev.eventTime
+                velocityX = 0f
+                dragMode = 0
+                baseDrawerProgress = if (isDrawerOpened()) 1f else 0f
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val dx = ev.x - startX
+                val dy = ev.y - startY
+                if (abs(dx) > touchSlop && abs(dx) > abs(dy) * 1.2f) {
+                    if (isDrawerOpened()) {
+                        dragMode = 1
+                        return true
+                    } else if (dx > 0 && canSwipeLeftDrawer()) {
+                        dragMode = 1
+                        return true
+                    } else if (dx < 0 && canSwipeRightList()) {
+                        dragMode = 2
+                        return true
+                    }
+                }
+            }
+        }
+        return super.onInterceptTouchEvent(ev)
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    override fun onTouchEvent(ev: MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_MOVE -> {
+                val now = ev.eventTime
+                val dt = (now - lastMoveTime).coerceAtLeast(1L)
+                velocityX = (ev.x - lastX) / dt * 1000f
+                lastX = ev.x
+                lastMoveTime = now
+
+                val dx = ev.x - startX
+                if (dragMode == 1) {
+                    val w = getDrawerWidthPx().coerceAtLeast(1f)
+                    val progress = (baseDrawerProgress + dx / w).coerceIn(0f, 1f)
+                    onDrawerDragProgress(progress)
+                    return true
+                } else if (dragMode == 2) {
+                    return true
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                val dx = ev.x - startX
+                if (dragMode == 1) {
+                    val w = getDrawerWidthPx().coerceAtLeast(1f)
+                    val progress = (baseDrawerProgress + dx / w).coerceIn(0f, 1f)
+                    onDrawerDragRelease(velocityX, progress)
+                    dragMode = 0
+                    return true
+                } else if (dragMode == 2) {
+                    if (dx < -touchSlop * 3f || velocityX < -600f) {
+                        onSwipeOpenList()
+                    }
+                    dragMode = 0
+                    return true
+                }
+                dragMode = 0
+            }
+        }
+        return true
+    }
+}
+
 // ==================== MAIN ACTIVITY ====================
 
 class MainActivity : ComponentActivity() {
+
+    companion object {
+        const val APP_VERSION = "3.1"
+    }
 
     private lateinit var storage: AppStorage
     private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -302,7 +413,7 @@ class MainActivity : ComponentActivity() {
     // Состояния UI
     private var showListScreen = false
     private var isDrawerOpen = false
-    private var isShelfLocked = false
+    private var isSwipesLocked = false
     private var torchEnabled = false
     private var fullFrameScan = false
     private var zoomPresetIndex = 1 // 0=0.6x, 1=1x, 2=2x, 3=3x
@@ -310,7 +421,7 @@ class MainActivity : ComponentActivity() {
     private var searchQuery = ""
     private val expandedGroups = mutableSetOf<String>()
 
-    // Системные отступы (статус-бар и навигация)
+    // Системные отступы
     private var sysTopInset = 0
     private var sysBottomInset = 0
 
@@ -328,8 +439,9 @@ class MainActivity : ComponentActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
 
     // Основные View
-    private lateinit var rootFrame: FrameLayout
+    private lateinit var rootFrame: SwipeHostFrameLayout
     private lateinit var headerContainer: LinearLayout
+    private lateinit var btnMenu: TextView
     private lateinit var tvThresholdBadge: TextView
     private lateinit var btnZoom: TextView
     private lateinit var btnScanArea: TextView
@@ -342,6 +454,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var cameraSection: FrameLayout
     private lateinit var previewView: PreviewView
     private lateinit var reticleView: View
+    private lateinit var focusRingView: View
     private lateinit var tvPermissionHint: TextView
     private lateinit var bottomHud: LinearLayout
     private lateinit var tvStatAll: TextView
@@ -355,7 +468,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var tvBannerStatus: TextView
     private lateinit var tvBannerDuplicateBadge: TextView
     private lateinit var tvBannerName: TextView
-    private lateinit var tvBannerDate: TextView
+    private lateinit var tvBannerProdDate: TextView
     private lateinit var fifoContainerBanner: LinearLayout
     private lateinit var fifoFillBanner: View
     private lateinit var tvFifoLabelBanner: TextView
@@ -364,6 +477,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var listSection: LinearLayout
     private lateinit var phoneListTopBar: LinearLayout
     private lateinit var tvPhoneListTitle: TextView
+    private lateinit var tsdInputContainer: LinearLayout
+    private lateinit var etTsdScanCapture: EditText
     private val tabViews = mutableMapOf<FilterTab, TextView>()
     private lateinit var btnGroupToggle: TextView
     private lateinit var etSearch: EditText
@@ -373,9 +488,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var btnCopySummary: TextView
     private lateinit var btnExportAll: TextView
 
-    // Вспышка и замок
+    // Мягкая световая индикация
     private lateinit var flashOverlay: View
-    private lateinit var lockOverlay: FrameLayout
 
     // Боковая шторка
     private lateinit var drawerScrim: View
@@ -416,7 +530,7 @@ class MainActivity : ComponentActivity() {
     private val scanReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent == null) return
-            val code = intent.getStringExtra("scannerdata") // MERTECH Seuic AutoID Q9C (ScanTool)
+            val code = intent.getStringExtra("scannerdata")
                 ?: intent.getStringExtra("barcode_string")
                 ?: intent.getStringExtra("data")
                 ?: intent.getStringExtra("SCAN_BARCODE1")
@@ -449,6 +563,15 @@ class MainActivity : ComponentActivity() {
 
         if (!storage.tsdMode) {
             ensureCameraStarted()
+        } else {
+            focusTsdCaptureField()
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (storage.tsdMode) {
+            focusTsdCaptureField()
         }
     }
 
@@ -463,7 +586,7 @@ class MainActivity : ComponentActivity() {
         uiScope.cancel()
     }
 
-    // ==================== СИСТЕМНЫЕ ОТСТУПЫ (STATUS BAR & NAVIGATION BAR) ====================
+    // ==================== СИСТЕМНЫЕ ОТСТУПЫ ====================
 
     private fun setupSystemInsets() {
         ViewCompat.setOnApplyWindowInsetsListener(rootFrame) { _, insets ->
@@ -520,7 +643,7 @@ class MainActivity : ComponentActivity() {
 
     private fun registerScannerBroadcast() {
         val filter = IntentFilter().apply {
-            addAction("com.android.server.scannerservice.broadcast") // Seuic ScanTool
+            addAction("com.android.server.scannerservice.broadcast")
             addAction("android.intent.ACTION_DECODE_DATA")
             addAction("nlscan.action.SCANNER_RESULT")
             addAction("com.scanner.broadcast")
@@ -577,27 +700,33 @@ class MainActivity : ComponentActivity() {
 
     @SuppressLint("ClickableViewAccessibility")
     private fun buildUi() {
-        rootFrame = FrameLayout(this).apply {
+        rootFrame = SwipeHostFrameLayout(this).apply {
             layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-        }
-
-        val swipeDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
-            override fun onFling(e1: MotionEvent?, e2: MotionEvent, velocityX: Float, velocityY: Float): Boolean {
-                if (isShelfLocked || e1 == null) return false
-                val dx = e2.x - e1.x
-                val dy = e2.y - e1.y
-                if (abs(dx) > abs(dy) && abs(dx) > dp(60)) {
-                    if (dx > 0 && !isDrawerOpen && e1.x < dp(65)) {
-                        openDrawer()
-                        return true
-                    } else if (dx < 0 && isDrawerOpen) {
-                        closeDrawer()
-                        return true
-                    }
+            canSwipeLeftDrawer = { !isSwipesLocked && !isDrawerOpen }
+            canSwipeRightList = { !isSwipesLocked && !isDrawerOpen && !storage.tsdMode && !showListScreen }
+            isDrawerOpened = { isDrawerOpen }
+            getDrawerWidthPx = { dp(305).toFloat() }
+            onDrawerDragProgress = { progress ->
+                val w = dp(305).toFloat()
+                if (drawerPanel.visibility != View.VISIBLE) {
+                    drawerPanel.visibility = View.VISIBLE
+                    drawerScrim.visibility = View.VISIBLE
                 }
-                return false
+                drawerPanel.translationX = -w * (1f - progress)
+                drawerScrim.alpha = progress
             }
-        })
+            onDrawerDragRelease = { vx, progress ->
+                if (vx > 500f || (vx >= -300f && progress >= 0.45f)) {
+                    openDrawer()
+                } else {
+                    closeDrawer()
+                }
+            }
+            onSwipeOpenList = {
+                showListScreen = true
+                refreshAllUi()
+            }
+        }
 
         val mainColumn = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -615,7 +744,7 @@ class MainActivity : ComponentActivity() {
             gravity = Gravity.CENTER_VERTICAL
         }
 
-        val btnMenu = TextView(this).apply {
+        btnMenu = TextView(this).apply {
             text = "☰"
             textSize = 20f
             setTypeface(null, Typeface.BOLD)
@@ -657,9 +786,14 @@ class MainActivity : ComponentActivity() {
         }
         topRow.addView(btnTorch, marginRightParams(5))
 
-        btnLock = makeHeaderChip("🔒") {
-            isShelfLocked = true
-            lockOverlay.visibility = View.VISIBLE
+        btnLock = makeHeaderChip("🔓") {
+            isSwipesLocked = !isSwipesLocked
+            refreshAllUi()
+            Toast.makeText(
+                this@MainActivity,
+                if (isSwipesLocked) "Свайпы заблокированы" else "Свайпы разблокированы",
+                Toast.LENGTH_SHORT
+            ).show()
         }
         topRow.addView(btnLock, marginRightParams(5))
 
@@ -735,12 +869,12 @@ class MainActivity : ComponentActivity() {
         }
         activeBannerCard.addView(tvBannerName)
 
-        tvBannerDate = TextView(this).apply {
+        tvBannerProdDate = TextView(this).apply {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 topMargin = dp(3)
             }
         }
-        activeBannerCard.addView(tvBannerDate)
+        activeBannerCard.addView(tvBannerProdDate)
 
         fifoContainerBanner = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -778,10 +912,12 @@ class MainActivity : ComponentActivity() {
         }
         cameraSection.addView(previewView)
 
+        // Контейнер-видоискатель строго над нижней панелью (для симметрии прицела)
+        val viewfinderArea = FrameLayout(this).apply {
+            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        }
         reticleView = View(this).apply {
-            layoutParams = FrameLayout.LayoutParams(dp(210), dp(210), Gravity.CENTER).apply {
-                bottomMargin = dp(45)
-            }
+            layoutParams = FrameLayout.LayoutParams(dp(205), dp(205), Gravity.CENTER)
             background = GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
                 cornerRadius = dp(16).toFloat()
@@ -789,7 +925,31 @@ class MainActivity : ComponentActivity() {
                 setStroke(dp(2), Color.parseColor("#BF38BDF8"))
             }
         }
-        cameraSection.addView(reticleView)
+        viewfinderArea.addView(reticleView)
+
+        focusRingView = View(this).apply {
+            layoutParams = FrameLayout.LayoutParams(dp(64), dp(64))
+            visibility = View.GONE
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.TRANSPARENT)
+                setStroke(dp(2), Color.parseColor("#FACC15"))
+            }
+        }
+        viewfinderArea.addView(focusRingView)
+        cameraSection.addView(viewfinderArea)
+
+        // Точечный фокус по касанию экрана камеры (Tap-to-Focus)
+        val tapDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onSingleTapUp(e: MotionEvent): Boolean {
+                triggerTapToFocus(e.x, e.y)
+                return true
+            }
+        })
+        previewView.setOnTouchListener { _, event ->
+            tapDetector.onTouchEvent(event)
+            true
+        }
 
         tvPermissionHint = TextView(this).apply {
             text = "Нажмите, чтобы разрешить доступ к камере"
@@ -807,6 +967,16 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(10), dp(10), dp(10), dp(12))
             layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM)
+        }
+
+        // Автоматическая синхронизация нижнего отступа видоискателя с высотой нижней панели
+        bottomHud.addOnLayoutChangeListener { _, _, top, _, bottom, _, _, _, _ ->
+            val hudH = bottom - top
+            val lp = viewfinderArea.layoutParams as FrameLayout.LayoutParams
+            if (lp.bottomMargin != hudH) {
+                lp.bottomMargin = hudH
+                viewfinderArea.layoutParams = lp
+            }
         }
 
         val statsRow = LinearLayout(this).apply {
@@ -870,6 +1040,63 @@ class MainActivity : ComponentActivity() {
         phoneListTopBar.addView(tvPhoneListTitle)
         phoneListTopBar.addView(btnClearList)
         listSection.addView(phoneListTopBar)
+
+        // Поле автозахвата скана для режима ТСД (без вызова экранной клавиатуры)
+        tsdInputContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(8)
+            }
+        }
+        val tvScanDot = TextView(this).apply {
+            text = "●"
+            textSize = 14f
+            setTextColor(Color.parseColor("#10B981"))
+            setPadding(0, 0, dp(8), 0)
+        }
+        etTsdScanCapture = EditText(this).apply {
+            hint = "Готов к приёму кода с аппаратного сканера..."
+            isSingleLine = true
+            background = null
+            setPadding(0, dp(2), 0, dp(2))
+            showSoftInputOnFocus = false
+            imeOptions = EditorInfo.IME_ACTION_DONE
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+
+            setOnKeyListener { _, keyCode, event ->
+                if (event.action == KeyEvent.ACTION_DOWN && (keyCode == KeyEvent.KEYCODE_ENTER || keyCode == KeyEvent.KEYCODE_TAB)) {
+                    val raw = text?.toString() ?: ""
+                    if (raw.isNotBlank()) {
+                        setText("")
+                        onRawBarcodeDetected(raw)
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+
+            addTextChangedListener(object : TextWatcher {
+                private var selfClear = false
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                override fun afterTextChanged(s: Editable?) {
+                    if (selfClear) return
+                    val str = s?.toString() ?: ""
+                    if (str.contains("\n") || str.contains("\r") || str.length >= 24) {
+                        selfClear = true
+                        setText("")
+                        selfClear = false
+                        onRawBarcodeDetected(str)
+                    }
+                }
+            })
+        }
+        tsdInputContainer.addView(tvScanDot)
+        tsdInputContainer.addView(etTsdScanCapture)
+        listSection.addView(tsdInputContainer)
 
         bannerSlotTsd = FrameLayout(this).apply {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
@@ -995,65 +1222,21 @@ class MainActivity : ComponentActivity() {
 
         rootFrame.addView(mainColumn)
 
-        // ===== 5. ПОЛНОЭКРАННАЯ ЦВЕТОВАЯ ВСПЫШКА =====
+        // ===== 5. МЯГКАЯ ЦВЕТОВАЯ ПОДСВЕТКА КОНТУРА ПРИ СКАНЕ =====
         flashOverlay = View(this).apply {
             layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
             visibility = View.GONE
+            alpha = 0f
             isClickable = false
         }
         rootFrame.addView(flashOverlay)
 
-        // ===== 6. ЗАМОК ОТ СЛУЧАЙНЫХ КАСАНИЙ НА ПОЛКЕ =====
-        lockOverlay = FrameLayout(this).apply {
-            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-            setBackgroundColor(Color.parseColor("#B3000000"))
-            visibility = View.GONE
-            isClickable = true
-            isLongClickable = true
-            setOnLongClickListener {
-                isShelfLocked = false
-                visibility = View.GONE
-                Toast.makeText(this@MainActivity, "Экран разблокирован", Toast.LENGTH_SHORT).show()
-                true
-            }
-        }
-        val lockCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(dp(22), dp(20), dp(22), dp(20))
-            background = roundedBg(Color.parseColor("#131720"), 16, Color.parseColor("#3B82F6"), 1)
-            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER).apply {
-                marginStart = dp(24)
-                marginEnd = dp(24)
-            }
-        }
-        lockCard.addView(TextView(this).apply {
-            text = "🔒"
-            textSize = 32f
-            gravity = Gravity.CENTER
-        })
-        lockCard.addView(TextView(this).apply {
-            text = "Экран заблокирован от полки"
-            setTextColor(Color.WHITE)
-            textSize = 16f
-            setTypeface(null, Typeface.BOLD)
-            gravity = Gravity.CENTER
-            setPadding(0, dp(8), 0, dp(6))
-        })
-        lockCard.addView(TextView(this).apply {
-            text = "Сканер и вибрация активны.\nУдерживайте палец на экране 1 сек для разблокировки."
-            setTextColor(Color.parseColor("#94A3B8"))
-            textSize = 13f
-            gravity = Gravity.CENTER
-        })
-        lockOverlay.addView(lockCard)
-        rootFrame.addView(lockOverlay)
-
-        // ===== 7. БОКОВАЯ ШТОРКА НАСТРОЕК =====
+        // ===== 6. БОКОВАЯ ШТОРКА НАСТРОЕК =====
         drawerScrim = View(this).apply {
             layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
             setBackgroundColor(Color.parseColor("#99000000"))
             visibility = View.GONE
+            alpha = 0f
             setOnClickListener { closeDrawer() }
         }
         rootFrame.addView(drawerScrim)
@@ -1065,11 +1248,6 @@ class MainActivity : ComponentActivity() {
         }
         buildDrawerContent()
         rootFrame.addView(drawerPanel)
-
-        rootFrame.setOnTouchListener { _, event ->
-            swipeDetector.onTouchEvent(event)
-            false
-        }
 
         setContentView(rootFrame)
     }
@@ -1095,7 +1273,7 @@ class MainActivity : ComponentActivity() {
         col.addView(makeDrawerSectionHeader("Оборудование", p))
         col.addView(makeDrawerSwitch(
             title = "Режим ТСД (без камеры)",
-            subtitle = "Для MERTECH Seuic AutoID Q9C и 2D-сканеров",
+            subtitle = "Аппаратный ввод 2D-сканера для терминалов сбора данных",
             checked = storage.tsdMode,
             p = p
         ) { enabled ->
@@ -1104,6 +1282,7 @@ class MainActivity : ComponentActivity() {
                 torchEnabled = false
                 showListScreen = false
                 cameraProvider?.unbindAll()
+                focusTsdCaptureField()
             } else {
                 ensureCameraStarted()
             }
@@ -1134,8 +1313,8 @@ class MainActivity : ComponentActivity() {
         })
 
         col.addView(makeDrawerSwitch(
-            title = "Цветовая вспышка экрана",
-            subtitle = "Подсветка краёв зелёным/красным при скане",
+            title = "Световая индикация контура",
+            subtitle = "Мягкое свечение рамки при считывании кода",
             checked = storage.flashEnabled,
             p = p
         ) { enabled ->
@@ -1152,14 +1331,23 @@ class MainActivity : ComponentActivity() {
             refreshAllUi()
         })
 
-        col.addView(makeDrawerSectionHeader("Звук и ручной ввод", p))
+        col.addView(makeDrawerSectionHeader("Отклик и ввод", p))
         col.addView(makeDrawerSwitch(
             title = "Звуковой сигнал",
-            subtitle = "Вибрация работает всегда даже без звука",
+            subtitle = "Звуковое оповещение при проверке кода",
             checked = storage.soundEnabled,
             p = p
         ) { enabled ->
             storage.soundEnabled = enabled
+        })
+
+        col.addView(makeDrawerSwitch(
+            title = "Вибрация",
+            subtitle = "Тактильный отклик при сканировании",
+            checked = storage.vibrationEnabled,
+            p = p
+        ) { enabled ->
+            storage.vibrationEnabled = enabled
         })
 
         val btnManual = TextView(this).apply {
@@ -1278,20 +1466,27 @@ class MainActivity : ComponentActivity() {
         }
         col.addView(divider)
 
-        col.addView(TextView(this).apply {
-            text = "AOR Systems"
+        val brandBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+            setOnClickListener { showChangelogDialog() }
+        }
+        brandBox.addView(TextView(this).apply {
+            text = "AOR Systems™"
             textSize = spSize(15f)
             setTypeface(null, Typeface.BOLD)
             setTextColor(p.textPrimary)
             gravity = Gravity.CENTER
         })
-        col.addView(TextView(this).apply {
-            text = "Версия 3.0"
+        brandBox.addView(TextView(this).apply {
+            text = "Версия $APP_VERSION • Что нового ▸"
             textSize = spSize(12f)
-            setTextColor(p.textSecondary)
+            setTextColor(p.primary)
             gravity = Gravity.CENTER
-            setPadding(0, dp(2), 0, 0)
+            setPadding(0, dp(3), 0, 0)
         })
+        col.addView(brandBox)
 
         drawerPanel.addView(col)
     }
@@ -1300,15 +1495,27 @@ class MainActivity : ComponentActivity() {
         isDrawerOpen = true
         drawerScrim.visibility = View.VISIBLE
         drawerPanel.visibility = View.VISIBLE
+        drawerScrim.animate().alpha(1f).setDuration(200).start()
         drawerPanel.animate().translationX(0f).setDuration(200).start()
     }
 
     private fun closeDrawer() {
         isDrawerOpen = false
-        drawerScrim.visibility = View.GONE
+        drawerScrim.animate().alpha(0f).setDuration(180).withEndAction {
+            if (!isDrawerOpen) drawerScrim.visibility = View.GONE
+        }.start()
         drawerPanel.animate().translationX(-dp(305).toFloat()).setDuration(180).withEndAction {
             if (!isDrawerOpen) drawerPanel.visibility = View.GONE
         }.start()
+    }
+
+    private fun focusTsdCaptureField() {
+        if (!storage.tsdMode) return
+        mainHandler.postDelayed({
+            etTsdScanCapture.requestFocus()
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+            imm?.hideSoftInputFromWindow(etTsdScanCapture.windowToken, 0)
+        }, 120)
     }
 
     private fun makeDrawerSectionHeader(title: String, p: ThemePalette): TextView {
@@ -1410,6 +1617,9 @@ class MainActivity : ComponentActivity() {
         rootFrame.setBackgroundColor(p.bg)
         headerContainer.setBackgroundColor(p.surface)
 
+        // Видимость кнопки меню в светлой и тёмной темах
+        btnMenu.setTextColor(p.textPrimary)
+
         val dateStr = formatShortDayMonth(thresholdMillis())
         tvThresholdBadge.text = if (tsd) "ТСД • До $dateStr" else "До $dateStr"
         tvThresholdBadge.textSize = spSize(13f)
@@ -1435,7 +1645,11 @@ class MainActivity : ComponentActivity() {
         btnTorch.background = roundedBg(if (torchEnabled) Color.parseColor("#F59E0B") else p.surfaceAlt, 8)
         btnTorch.setTextColor(if (torchEnabled) Color.BLACK else p.textPrimary)
 
-        styleChip(btnLock, false, p)
+        // Кнопка замка свайпов
+        btnLock.text = if (isSwipesLocked) "🔒" else "🔓"
+        btnLock.background = roundedBg(if (isSwipesLocked) p.primary else p.surfaceAlt, 8)
+        btnLock.setTextColor(if (isSwipesLocked) Color.WHITE else p.textPrimary)
+
         styleChip(btnReset, false, p)
 
         for ((days, tv) in presetViews) {
@@ -1450,12 +1664,19 @@ class MainActivity : ComponentActivity() {
             cameraSection.visibility = View.GONE
             listSection.visibility = View.VISIBLE
             phoneListTopBar.visibility = View.GONE
+            tsdInputContainer.visibility = View.VISIBLE
+            tsdInputContainer.background = roundedBg(p.surface, 10, Color.parseColor("#10B981"), 1)
+            etTsdScanCapture.setTextColor(p.textPrimary)
+            etTsdScanCapture.setHintTextColor(p.textSecondary)
+            etTsdScanCapture.textSize = spSize(13f)
             bannerSlotTsd.visibility = View.VISIBLE
             attachBannerCardTo(bannerSlotTsd)
+            focusTsdCaptureField()
         } else if (showListScreen) {
             cameraSection.visibility = View.GONE
             listSection.visibility = View.VISIBLE
             phoneListTopBar.visibility = View.VISIBLE
+            tsdInputContainer.visibility = View.GONE
             bannerSlotTsd.visibility = View.GONE
             tvPhoneListTitle.text = "Отсканировано: ${items.size}"
             tvPhoneListTitle.textSize = spSize(15f)
@@ -1463,6 +1684,7 @@ class MainActivity : ComponentActivity() {
         } else {
             cameraSection.visibility = View.VISIBLE
             listSection.visibility = View.GONE
+            tsdInputContainer.visibility = View.GONE
             bottomHud.setBackgroundColor(Color.argb(235, Color.red(p.bg), Color.green(p.bg), Color.blue(p.bg)))
             attachBannerCardTo(bannerSlotCamera)
         }
@@ -1533,13 +1755,12 @@ class MainActivity : ComponentActivity() {
             tvBannerStatus.textSize = spSize(if (large) 15f else 13f)
             tvBannerDuplicateBadge.visibility = View.GONE
             tvBannerName.visibility = View.GONE
-            tvBannerDate.visibility = View.GONE
+            tvBannerProdDate.visibility = View.GONE
             fifoContainerBanner.visibility = View.GONE
             return
         }
 
         tvBannerName.visibility = View.VISIBLE
-        tvBannerDate.visibility = View.VISIBLE
 
         val expired = isItemExpired(item)
         val borderColor = when {
@@ -1551,11 +1772,13 @@ class MainActivity : ComponentActivity() {
 
         activeBannerCard.background = roundedBg(p.surface, 12, borderColor, 2)
 
+        // Срок годности теперь сразу возле статуса
+        val expFormatted = formatRuDate(item.expDate)
         tvBannerStatus.text = when {
             item.isLoading -> "⏳ Запрос в Честный ЗНАК..."
-            item.status == "RETIRED" -> "⛔ ВЫБЫЛ ИЗ ОБОРОТА!"
-            expired -> "🚨 ПРОСРОЧКА / СПИСАТЬ"
-            item.expDate != null -> "✅ ГОДЕН"
+            item.status == "RETIRED" -> if (item.expDate != null) "⛔ ВЫБЫЛ: до $expFormatted" else "⛔ ВЫБЫЛ ИЗ ОБОРОТА!"
+            expired && item.expDate != null -> "🚨 ПРОСРОЧКА: до $expFormatted"
+            item.expDate != null -> "✅ ГОДЕН: до $expFormatted"
             else -> "⚠️ НЕТ ДАТЫ В ЧЗ"
         }
         tvBannerStatus.setTextColor(borderColor)
@@ -1570,14 +1793,24 @@ class MainActivity : ComponentActivity() {
         tvBannerName.setTextColor(p.textPrimary)
         tvBannerName.textSize = spSize(if (large) 16f else 14f)
 
-        tvBannerDate.text = when {
-            item.expDate != null -> "Срок годности: до ${formatRuDate(item.expDate)}"
-            !item.infoMsg.isNullOrBlank() -> item.infoMsg
-            else -> "GTIN ${item.gtin} • SN: ${item.sn}"
+        // Нижняя строка под названием — Дата производства (или техническая информация, если даты нет)
+        when {
+            !item.prodDate.isNullOrBlank() -> {
+                tvBannerProdDate.visibility = View.VISIBLE
+                tvBannerProdDate.text = "Дата производства: ${formatRuDate(item.prodDate)}"
+                tvBannerProdDate.setTextColor(p.textSecondary)
+                tvBannerProdDate.textSize = spSize(if (large) 14f else 12f)
+            }
+            !item.infoMsg.isNullOrBlank() -> {
+                tvBannerProdDate.visibility = View.VISIBLE
+                tvBannerProdDate.text = item.infoMsg
+                tvBannerProdDate.setTextColor(p.textSecondary)
+                tvBannerProdDate.textSize = spSize(12f)
+            }
+            else -> {
+                tvBannerProdDate.visibility = View.GONE
+            }
         }
-        tvBannerDate.setTextColor(if (expired) Color.parseColor("#EF4444") else p.textPrimary)
-        tvBannerDate.setTypeface(null, if (item.expDate != null) Typeface.BOLD else Typeface.NORMAL)
-        tvBannerDate.textSize = spSize(if (large) 15f else 13f)
 
         if (storage.fifoBarEnabled && item.expDate != null) {
             val expMs = parseIsoToMillis(item.expDate)
@@ -1748,12 +1981,37 @@ class MainActivity : ComponentActivity() {
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             }
 
+            val expFormatted = formatRuDate(item.expDate)
+            val statusText = when {
+                item.isLoading -> "⏳ Проверка в Честном ЗНАКе..."
+                item.status == "RETIRED" -> if (item.expDate != null) "⛔ ВЫБЫЛ: до $expFormatted" else "⛔ ВЫБЫЛ"
+                expired && item.expDate != null -> "🚨 ПРОСРОЧКА: до $expFormatted"
+                item.expDate != null -> "✅ Годен: до $expFormatted"
+                else -> item.infoMsg ?: "⚠️ Срок не указан"
+            }
+            infoCol.addView(TextView(this@MainActivity).apply {
+                text = statusText
+                setTypeface(null, Typeface.BOLD)
+                textSize = spSize(13f)
+                setTextColor(borderColor)
+            })
+
             if (!compact) {
                 infoCol.addView(TextView(this@MainActivity).apply {
                     text = item.name ?: "Загрузка названия..."
                     setTypeface(null, Typeface.BOLD)
                     textSize = spSize(14f)
                     setTextColor(p.textPrimary)
+                    setPadding(0, dp(2), 0, 0)
+                })
+            }
+
+            if (!item.prodDate.isNullOrBlank()) {
+                infoCol.addView(TextView(this@MainActivity).apply {
+                    text = "Дата производства: ${formatRuDate(item.prodDate)}"
+                    textSize = spSize(12f)
+                    setTextColor(p.textSecondary)
+                    setPadding(0, dp(2), 0, 0)
                 })
             }
 
@@ -1761,21 +2019,7 @@ class MainActivity : ComponentActivity() {
                 text = "GTIN: ${item.gtin} • SN: ${item.sn}"
                 textSize = spSize(11f)
                 setTextColor(p.textSecondary)
-                setPadding(0, dp(2), 0, dp(2))
-            })
-
-            val statusText = when {
-                item.isLoading -> "Проверка в Честном ЗНАКе..."
-                item.status == "RETIRED" -> "ВЫБЫЛ (до ${formatRuDate(item.expDate)})"
-                expired && item.expDate != null -> "ПРОСРОЧКА: до ${formatRuDate(item.expDate)}"
-                item.expDate != null -> "Годен: до ${formatRuDate(item.expDate)}"
-                else -> item.infoMsg ?: "Срок не указан"
-            }
-            infoCol.addView(TextView(this@MainActivity).apply {
-                text = statusText
-                setTypeface(null, Typeface.BOLD)
-                textSize = spSize(13f)
-                setTextColor(borderColor)
+                setPadding(0, dp(2), 0, 0)
             })
 
             val btnDel = TextView(this@MainActivity).apply {
@@ -1863,6 +2107,7 @@ class MainActivity : ComponentActivity() {
                         it.copy(
                             name = res.name ?: it.name,
                             expDate = res.expDate,
+                            prodDate = res.prodDate,
                             status = res.status,
                             infoMsg = res.error,
                             isLoading = false
@@ -1888,64 +2133,82 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun triggerFeedback(expired: Boolean, isDuplicate: Boolean) {
-        val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager)?.defaultVibrator
-        } else {
-            @Suppress("DEPRECATION")
-            getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
-        }
-
-        if (isDuplicate) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                vibrator?.vibrate(VibrationEffect.createOneShot(18, 90))
+        if (storage.vibrationEnabled) {
+            val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager)?.defaultVibrator
             } else {
                 @Suppress("DEPRECATION")
-                vibrator?.vibrate(18)
+                getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
             }
-            return
+
+            if (isDuplicate) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    vibrator?.vibrate(VibrationEffect.createOneShot(18, 90))
+                } else {
+                    @Suppress("DEPRECATION")
+                    vibrator?.vibrate(18)
+                }
+            } else if (expired) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    vibrator?.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 220, 90, 220), -1))
+                } else {
+                    @Suppress("DEPRECATION")
+                    vibrator?.vibrate(longArrayOf(0, 220, 90, 220), -1)
+                }
+            } else {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    vibrator?.vibrate(VibrationEffect.createOneShot(38, VibrationEffect.DEFAULT_AMPLITUDE))
+                } else {
+                    @Suppress("DEPRECATION")
+                    vibrator?.vibrate(38)
+                }
+            }
         }
+
+        if (isDuplicate) return
 
         if (expired) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                vibrator?.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 220, 90, 220), -1))
-            } else {
-                @Suppress("DEPRECATION")
-                vibrator?.vibrate(longArrayOf(0, 220, 90, 220), -1)
-            }
             if (storage.soundEnabled) {
                 toneGen?.startTone(ToneGenerator.TONE_CDMA_EMERGENCY_RINGBACK, 350)
             }
             if (storage.flashEnabled) {
-                showScreenFlash(Color.parseColor("#EF4444"), 460L)
+                showSoftContourPulse(Color.parseColor("#EF4444"))
             }
         } else {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                vibrator?.vibrate(VibrationEffect.createOneShot(38, VibrationEffect.DEFAULT_AMPLITUDE))
-            } else {
-                @Suppress("DEPRECATION")
-                vibrator?.vibrate(38)
-            }
             if (storage.soundEnabled) {
                 toneGen?.startTone(ToneGenerator.TONE_PROP_BEEP, 110)
             }
             if (storage.flashEnabled) {
-                showScreenFlash(Color.parseColor("#10B981"), 320L)
+                showSoftContourPulse(Color.parseColor("#10B981"))
             }
         }
     }
 
-    private fun showScreenFlash(color: Int, durationMs: Long) {
+    // Мягкое плавное свечение контура экрана вместо резкой вспышки
+    private fun showSoftContourPulse(color: Int) {
         val gd = GradientDrawable().apply {
             shape = GradientDrawable.RECTANGLE
-            setColor(Color.argb(55, Color.red(color), Color.green(color), Color.blue(color)))
-            setStroke(dp(10), color)
+            setColor(Color.TRANSPARENT)
+            setStroke(dp(6), color)
         }
+        flashOverlay.animate().cancel()
         flashOverlay.background = gd
+        flashOverlay.alpha = 0f
         flashOverlay.visibility = View.VISIBLE
-        mainHandler.postDelayed({ flashOverlay.visibility = View.GONE }, durationMs)
+        flashOverlay.animate()
+            .alpha(0.85f)
+            .setDuration(140L)
+            .withEndAction {
+                flashOverlay.animate()
+                    .alpha(0f)
+                    .setDuration(380L)
+                    .withEndAction { flashOverlay.visibility = View.GONE }
+                    .start()
+            }
+            .start()
     }
 
-    // ==================== КАМЕРА CAMERAX С МАКРО 0.6X ====================
+    // ==================== КАМЕРА CAMERAX, МАКРО 0.6X И TAP-TO-FOCUS ====================
 
     private fun ensureCameraStarted() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
@@ -1954,6 +2217,41 @@ class MainActivity : ComponentActivity() {
         } else {
             cameraPermLauncher.launch(Manifest.permission.CAMERA)
         }
+    }
+
+    private fun triggerTapToFocus(x: Float, y: Float) {
+        val cam = boundCamera ?: return
+        val factory = previewView.meteringPointFactory
+        val point = factory.createPoint(x, y)
+        val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
+            .setAutoCancelDuration(3, TimeUnit.SECONDS)
+            .build()
+        cam.cameraControl.startFocusAndMetering(action)
+
+        // Визуальное кольцо фокуса в точке нажатия
+        val ringHalf = dp(32)
+        focusRingView.animate().cancel()
+        val lp = focusRingView.layoutParams as FrameLayout.LayoutParams
+        lp.leftMargin = (x.toInt() - ringHalf).coerceAtLeast(0)
+        lp.topMargin = (y.toInt() - ringHalf).coerceAtLeast(0)
+        focusRingView.layoutParams = lp
+        focusRingView.scaleX = 1.25f
+        focusRingView.scaleY = 1.25f
+        focusRingView.alpha = 1f
+        focusRingView.visibility = View.VISIBLE
+        focusRingView.animate()
+            .scaleX(1f)
+            .scaleY(1f)
+            .setDuration(150L)
+            .withEndAction {
+                focusRingView.animate()
+                    .alpha(0f)
+                    .setStartDelay(350L)
+                    .setDuration(250L)
+                    .withEndAction { focusRingView.visibility = View.GONE }
+                    .start()
+            }
+            .start()
     }
 
     @SuppressLint("UnsafeOptInUsageError")
@@ -2033,7 +2331,27 @@ class MainActivity : ComponentActivity() {
         cam.cameraControl.setZoomRatio(target)
     }
 
-    // ==================== ДИАЛОГИ ====================
+    // ==================== ДИАЛОГИ (СБРОС, РУЧНОЙ ВВОД, CHANGELOG) ====================
+
+    private fun showChangelogDialog() {
+        val notes = """
+            Версия $APP_VERSION (AOR Systems™)
+
+            • Срок годности перенесён в строку статуса («Годен / Просрочка: до ...»), а под названием отображается дата производства.
+            • Добавлен точечный автофокус по нажатию на экран камеры (Tap-to-Focus).
+            • Прицел камеры автоматически выравнивается по центру свободной области над нижней карточкой.
+            • Кнопка замка (🔒 / 🔓) теперь блокирует случайные свайпы в узких полках, оставляя нажатия и фокус активными.
+            • Добавлено плавное выдвижение левой шторки пальцем и открытие списка свайпом справа налево (в режиме смартфона).
+            • В режиме ТСД добавлено поле автозахвата кодов с постоянным фокусом без всплывающей клавиатуры.
+            • Добавлен отдельный переключатель вибрации, исправлена видимость иконки меню в светлой теме и смягчена световая индикация контура.
+        """.trimIndent()
+
+        AlertDialog.Builder(this)
+            .setTitle("Список изменений • v$APP_VERSION")
+            .setMessage(notes)
+            .setPositiveButton("Понятно", null)
+            .show()
+    }
 
     private fun confirmResetDialog() {
         AlertDialog.Builder(this)
@@ -2149,25 +2467,33 @@ class MainActivity : ComponentActivity() {
 
             val code = conn.responseCode
             if (code == 429 || code >= 500) {
-                return@withContext GatewayResult(null, null, null, "Сервер занят ($code)", shouldRetry = true)
+                return@withContext GatewayResult(null, null, null, null, "Сервер занят ($code)", shouldRetry = true)
             }
             if (code !in 200..299) {
-                return@withContext GatewayResult(null, null, null, "Ошибка шлюза HTTP $code", shouldRetry = false)
+                return@withContext GatewayResult(null, null, null, null, "Ошибка шлюза HTTP $code", shouldRetry = false)
             }
 
             val respText = conn.inputStream.bufferedReader(StandardCharsets.UTF_8).use { it.readText() }
             val json = JSONObject(respText)
             val results = json.optJSONArray("results")
             if (results == null || results.length() == 0) {
-                return@withContext GatewayResult(null, null, null, "Пустой ответ шлюза", shouldRetry = false)
+                return@withContext GatewayResult(null, null, null, null, "Пустой ответ шлюза", shouldRetry = false)
             }
 
             val first = results.getJSONObject(0)
             val err = if (first.isNull("error")) null else first.optString("error")
             val retryFromCrpt = err != null && (err.contains("429") || err.contains("Таймаут"))
 
+            val pDate = when {
+                !first.isNull("prodDate") -> first.optString("prodDate")
+                !first.isNull("producedDate") -> first.optString("producedDate")
+                !first.isNull("productionDate") -> first.optString("productionDate")
+                else -> null
+            }
+
             GatewayResult(
                 expDate = if (first.isNull("expDate")) null else first.optString("expDate"),
+                prodDate = pDate,
                 name = if (first.isNull("name")) null else first.optString("name"),
                 status = if (first.isNull("status")) null else first.optString("status"),
                 error = err,
@@ -2176,6 +2502,7 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             GatewayResult(
                 expDate = null,
+                prodDate = null,
                 name = null,
                 status = null,
                 error = "Сбой сети: ${e.localizedMessage ?: "таймаут"}",
@@ -2244,10 +2571,11 @@ class MainActivity : ComponentActivity() {
 
     private fun buildCsv(list: List<ScannedItem>): String {
         val sb = StringBuilder()
-        sb.appendLine("Наименование;GTIN;Серийный номер;Срок годности;Статус;Порог проверки")
+        sb.appendLine("Наименование;GTIN;Серийный номер;Дата производства;Срок годности;Статус;Порог проверки")
         val thrStr = SimpleDateFormat("dd.MM.yyyy", Locale.getDefault()).format(Date(thresholdMillis()))
         for (it in list) {
             val cleanName = (it.name ?: "Не определено").replace(";", ",")
+            val prodStr = formatRuDate(it.prodDate)
             val expStr = formatRuDate(it.expDate)
             val statusStr = when {
                 it.status == "RETIRED" -> "ВЫБЫЛ"
@@ -2255,7 +2583,7 @@ class MainActivity : ComponentActivity() {
                 it.expDate != null -> "ГОДЕН"
                 else -> it.infoMsg ?: "БЕЗ ДАТЫ"
             }
-            sb.appendLine("$cleanName;\"${it.gtin}\";\"${it.sn}\";$expStr;$statusStr;$thrStr")
+            sb.appendLine("$cleanName;\"${it.gtin}\";\"${it.sn}\";$prodStr;$expStr;$statusStr;$thrStr")
         }
         return sb.toString()
     }
@@ -2266,7 +2594,7 @@ class MainActivity : ComponentActivity() {
         val expired = items.filter { isItemExpired(it) }
 
         val sb = StringBuilder()
-        sb.appendLine("📋 Сводка ревизии (AOR Systems)")
+        sb.appendLine("📋 Сводка ревизии (AOR Systems™)")
         sb.appendLine("Дата: $nowStr | Порог: до $thrStr")
         sb.appendLine("Всего проверено: ${items.size} шт. | На списание: ${expired.size} шт.")
         sb.appendLine()
