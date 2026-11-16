@@ -1,7 +1,5 @@
 package com.revizor.scanner
 
-@file:OptIn(ExperimentalMaterial3Api::class)
-
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.BroadcastReceiver
@@ -62,7 +60,6 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -72,6 +69,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.LifecycleOwner
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
@@ -84,10 +82,10 @@ import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.charset.StandardCharsets
-import java.time.LocalDate
-import java.time.LocalDateTime
-import java.time.format.DateTimeFormatter
-import java.time.temporal.ChronoUnit
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.Executors
 import kotlin.random.Random
 
@@ -343,6 +341,69 @@ private val LightScheme = lightColorScheme(
     outline = Color(0xFFCBD5E1)
 )
 
+// ==================== УТИЛИТЫ ДАТ ====================
+
+private fun todayZeroMillis(): Long {
+    val c = Calendar.getInstance()
+    c.set(Calendar.HOUR_OF_DAY, 0)
+    c.set(Calendar.MINUTE, 0)
+    c.set(Calendar.SECOND, 0)
+    c.set(Calendar.MILLISECOND, 0)
+    return c.timeInMillis
+}
+
+private fun addDaysToTodayMillis(days: Int): Long {
+    val c = Calendar.getInstance()
+    c.timeInMillis = todayZeroMillis()
+    c.add(Calendar.DAY_OF_YEAR, days)
+    return c.timeInMillis
+}
+
+private fun parseIsoToMillis(iso: String?): Long? {
+    if (iso.isNullOrBlank() || iso.length < 10) return null
+    return try {
+        val parts = iso.take(10).split("-")
+        if (parts.size != 3) return null
+        val c = Calendar.getInstance()
+        c.set(Calendar.YEAR, parts[0].toInt())
+        c.set(Calendar.MONTH, parts[1].toInt() - 1)
+        c.set(Calendar.DAY_OF_MONTH, parts[2].toInt())
+        c.set(Calendar.HOUR_OF_DAY, 0)
+        c.set(Calendar.MINUTE, 0)
+        c.set(Calendar.SECOND, 0)
+        c.set(Calendar.MILLISECOND, 0)
+        c.timeInMillis
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private fun formatShortDayMonth(millis: Long): String {
+    val sdf = SimpleDateFormat("dd.MM", Locale.getDefault())
+    return sdf.format(Date(millis))
+}
+
+private fun formatIsoFileDate(): String {
+    val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
+    return sdf.format(Date())
+}
+
+private fun formatRuDate(iso: String?): String {
+    if (iso.isNullOrBlank() || iso.length < 10) return "—"
+    val parts = iso.take(10).split("-")
+    return if (parts.size == 3) "${parts[2]}.${parts[1]}.${parts[0]}" else iso
+}
+
+private fun parseRuToIso(ru: String): String? {
+    val parts = ru.trim().split(".")
+    if (parts.size != 3) return null
+    val d = parts[0].padStart(2, '0')
+    val m = parts[1].padStart(2, '0')
+    val y = parts[2]
+    if (y.length != 4) return null
+    return "$y-$m-$d"
+}
+
 // ==================== ОСНОВНОЙ UI ПРИЛОЖЕНИЯ ====================
 
 @Composable
@@ -365,7 +426,7 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
     var apiMode by remember { mutableStateOf(storage.apiMode) }
     var apiToken by remember { mutableStateOf(storage.apiToken) }
 
-    var showListSheet by remember { mutableStateOf(false) }
+    var showListScreen by remember { mutableStateOf(false) }
     var activeBannerKey by remember { mutableStateOf<String?>(null) }
     var isDuplicateBanner by remember { mutableStateOf(false) }
     var flashType by remember { mutableStateOf(FlashType.NONE) }
@@ -394,17 +455,12 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
     val scope = rememberCoroutineScope()
     val apiQueue = remember { Channel<ParsedDataMatrix>(Channel.UNLIMITED) }
 
-    val today = remember { LocalDate.now() }
-    val thresholdDate = remember(today, offsetDays) { today.plusDays(offsetDays.toLong()) }
+    val todayMillis = remember { todayZeroMillis() }
+    val thresholdMillis = remember(offsetDays) { addDaysToTodayMillis(offsetDays) }
 
     fun isExpired(expIso: String?): Boolean {
-        if (expIso.isNullOrBlank()) return false
-        return try {
-            val d = LocalDate.parse(expIso.take(10))
-            !d.isAfter(thresholdDate)
-        } catch (_: Exception) {
-            false
-        }
+        val expMs = parseIsoToMillis(expIso) ?: return false
+        return expMs <= thresholdMillis
     }
 
     fun updateItems(newList: List<ScannedItem>) {
@@ -432,12 +488,22 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
         }
 
         if (isDuplicate) {
-            vibrator?.vibrate(VibrationEffect.createOneShot(18, 90))
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator?.vibrate(VibrationEffect.createOneShot(18, 90))
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator?.vibrate(18)
+            }
             return
         }
 
         if (expired) {
-            vibrator?.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 220, 90, 220), -1))
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator?.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 220, 90, 220), -1))
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator?.vibrate(longArrayOf(0, 220, 90, 220), -1)
+            }
             if (soundEnabled) {
                 toneGen?.startTone(ToneGenerator.TONE_CDMA_EMERGENCY_RINGBACK, 350)
             }
@@ -449,7 +515,12 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
                 }
             }
         } else {
-            vibrator?.vibrate(VibrationEffect.createOneShot(38, VibrationEffect.DEFAULT_AMPLITUDE))
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator?.vibrate(VibrationEffect.createOneShot(38, VibrationEffect.DEFAULT_AMPLITUDE))
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator?.vibrate(38)
+            }
             if (soundEnabled) {
                 toneGen?.startTone(ToneGenerator.TONE_PROP_BEEP, 110)
             }
@@ -569,8 +640,8 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
             addAction("nlscan.action.SCANNER_RESULT")
             addAction("com.scanner.broadcast")
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+        if (Build.VERSION.SDK_INT >= 33) {
+            context.registerReceiver(receiver, filter, 2)
         } else {
             @Suppress("DEPRECATION")
             context.registerReceiver(receiver, filter)
@@ -635,7 +706,10 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
                             onTsdModeChange = {
                                 tsdMode = it
                                 storage.tsdMode = it
-                                if (it) torchEnabled = false
+                                if (it) {
+                                    torchEnabled = false
+                                    showListScreen = false
+                                }
                             },
                             darkTheme = darkTheme,
                             onDarkThemeChange = {
@@ -687,158 +761,224 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
                         .fillMaxSize()
                         .background(MaterialTheme.colorScheme.background)
                 ) {
-                    Column(modifier = Modifier.fillMaxSize()) {
-                        TopControlHeader(
-                            thresholdDate = thresholdDate,
-                            offsetDays = offsetDays,
-                            onSelectOffset = { days ->
-                                offsetDays = days
-                                storage.offsetDays = days
-                            },
-                            tsdMode = tsdMode,
-                            zoomPresetIndex = zoomPresetIndex,
-                            onCycleZoom = { zoomPresetIndex = (zoomPresetIndex + 1) % 4 },
-                            torchEnabled = torchEnabled,
-                            onToggleTorch = { torchEnabled = !torchEnabled },
-                            fullFrameScan = fullFrameScan,
-                            onToggleScanArea = { fullFrameScan = !fullFrameScan },
-                            onOpenDrawer = { scope.launch { drawerState.open() } },
-                            onLockScreen = { isShelfLocked = true },
-                            onRequestReset = {
-                                if (items.isNotEmpty()) showResetConfirm = true
-                            }
-                        )
-
-                        val activeItem = items.find { it.uniqueKey == activeBannerKey } ?: items.firstOrNull()
-                        val expiredCount = items.count { isExpired(it.expDate) || it.status == "RETIRED" }
-                        val noDateCount = items.count { it.expDate == null && !it.isLoading }
-
-                        if (tsdMode) {
-                            Column(
+                    if (showListScreen && !tsdMode) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .statusBarsPadding()
+                                .padding(horizontal = 12.dp)
+                        ) {
+                            Row(
                                 modifier = Modifier
-                                    .fillMaxSize()
-                                    .padding(horizontal = 10.dp)
+                                    .fillMaxWidth()
+                                    .padding(vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
                             ) {
-                                ActiveScanBannerCard(
-                                    item = activeItem,
-                                    isDuplicate = isDuplicateBanner,
-                                    isExpired = isExpired(activeItem?.expDate) || activeItem?.status == "RETIRED",
-                                    today = today,
-                                    thresholdDate = thresholdDate,
-                                    fifoBarEnabled = fifoBarEnabled,
-                                    isTsdLarge = true
+                                SmallActionChip(text = "← К камере", onClick = { showListScreen = false })
+                                Text(
+                                    text = "Отсканировано: ${items.size}",
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 15.sp,
+                                    color = MaterialTheme.colorScheme.onBackground
                                 )
-
-                                Spacer(Modifier.height(8.dp))
-
-                                ScannedListSection(
-                                    items = items,
-                                    selectedTab = selectedTab,
-                                    onSelectTab = { selectedTab = it },
-                                    searchQuery = searchQuery,
-                                    onSearchChange = { searchQuery = it },
-                                    groupByName = groupByName,
-                                    onToggleGroup = {
-                                        groupByName = it
-                                        storage.groupByName = it
-                                    },
-                                    expandedGroups = expandedGroups,
-                                    onToggleGroupExpand = { key ->
-                                        expandedGroups = if (key in expandedGroups) expandedGroups - key else expandedGroups + key
-                                    },
-                                    isExpiredFn = { isExpired(it.expDate) || it.status == "RETIRED" },
-                                    today = today,
-                                    thresholdDate = thresholdDate,
-                                    fifoBarEnabled = fifoBarEnabled,
-                                    onDeleteItem = { key -> updateItems(items.filterNot { it.uniqueKey == key }) },
-                                    onExportExpiredCsv = {
-                                        csvContentToSave = buildCsv(items.filter { isExpired(it.expDate) || it.status == "RETIRED" }, thresholdDate)
-                                        csvLauncher.launch("AOR_Prosrochka_${LocalDate.now()}.csv")
-                                    },
-                                    onExportAllCsv = {
-                                        csvContentToSave = buildCsv(items, thresholdDate)
-                                        csvLauncher.launch("AOR_Reviziya_${LocalDate.now()}.csv")
-                                    },
-                                    onCopySummary = {
-                                        val txt = buildMessengerSummary(items, thresholdDate) { isExpired(it.expDate) || it.status == "RETIRED" }
-                                        clipboard.setText(AnnotatedString(txt))
-                                        Toast.makeText(context, "Сводка скопирована для мессенджера", Toast.LENGTH_SHORT).show()
-                                    },
-                                    modifier = Modifier.weight(1f)
+                                SmallActionChip(
+                                    text = "Очистить",
+                                    onClick = { if (items.isNotEmpty()) showResetConfirm = true }
                                 )
                             }
-                        } else {
-                            Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                                if (hasCameraPermission) {
-                                    CameraScannerView(
-                                        zoomPresetIndex = zoomPresetIndex,
-                                        torchEnabled = torchEnabled,
-                                        fullFrameScan = fullFrameScan,
-                                        onBarcodeScanned = ::onRawBarcodeDetected
-                                    )
-                                } else {
-                                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                                        Button(onClick = { permissionLauncher.launch(Manifest.permission.CAMERA) }) {
-                                            Text("Разрешить доступ к камере")
-                                        }
-                                    }
-                                }
 
+                            ScannedListSection(
+                                items = items,
+                                selectedTab = selectedTab,
+                                onSelectTab = { selectedTab = it },
+                                searchQuery = searchQuery,
+                                onSearchChange = { searchQuery = it },
+                                groupByName = groupByName,
+                                onToggleGroup = {
+                                    groupByName = it
+                                    storage.groupByName = it
+                                },
+                                expandedGroups = expandedGroups,
+                                onToggleGroupExpand = { key ->
+                                    expandedGroups = if (key in expandedGroups) expandedGroups - key else expandedGroups + key
+                                },
+                                isExpiredFn = { isExpired(it.expDate) || it.status == "RETIRED" },
+                                todayMillis = todayMillis,
+                                thresholdMillis = thresholdMillis,
+                                fifoBarEnabled = fifoBarEnabled,
+                                onDeleteItem = { key -> updateItems(items.filterNot { it.uniqueKey == key }) },
+                                onExportExpiredCsv = {
+                                    csvContentToSave = buildCsv(items.filter { isExpired(it.expDate) || it.status == "RETIRED" }, thresholdMillis)
+                                    csvLauncher.launch("AOR_Prosrochka_${formatIsoFileDate()}.csv")
+                                },
+                                onExportAllCsv = {
+                                    csvContentToSave = buildCsv(items, thresholdMillis)
+                                    csvLauncher.launch("AOR_Reviziya_${formatIsoFileDate()}.csv")
+                                },
+                                onCopySummary = {
+                                    val txt = buildMessengerSummary(items, thresholdMillis) { isExpired(it.expDate) || it.status == "RETIRED" }
+                                    clipboard.setText(AnnotatedString(txt))
+                                    Toast.makeText(context, "Сводка скопирована для мессенджера", Toast.LENGTH_SHORT).show()
+                                },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    } else {
+                        Column(modifier = Modifier.fillMaxSize()) {
+                            TopControlHeader(
+                                thresholdMillis = thresholdMillis,
+                                offsetDays = offsetDays,
+                                onSelectOffset = { days ->
+                                    offsetDays = days
+                                    storage.offsetDays = days
+                                },
+                                tsdMode = tsdMode,
+                                zoomPresetIndex = zoomPresetIndex,
+                                onCycleZoom = { zoomPresetIndex = (zoomPresetIndex + 1) % 4 },
+                                torchEnabled = torchEnabled,
+                                onToggleTorch = { torchEnabled = !torchEnabled },
+                                fullFrameScan = fullFrameScan,
+                                onToggleScanArea = { fullFrameScan = !fullFrameScan },
+                                onOpenDrawer = { scope.launch { drawerState.open() } },
+                                onLockScreen = { isShelfLocked = true },
+                                onRequestReset = {
+                                    if (items.isNotEmpty()) showResetConfirm = true
+                                }
+                            )
+
+                            val activeItem = items.find { it.uniqueKey == activeBannerKey } ?: items.firstOrNull()
+                            val expiredCount = items.count { isExpired(it.expDate) || it.status == "RETIRED" }
+                            val noDateCount = items.count { it.expDate == null && !it.isLoading }
+
+                            if (tsdMode) {
                                 Column(
                                     modifier = Modifier
-                                        .align(Alignment.BottomCenter)
-                                        .fillMaxWidth()
-                                        .background(MaterialTheme.colorScheme.background.copy(alpha = 0.92f))
-                                        .padding(10.dp)
+                                        .fillMaxSize()
+                                        .padding(horizontal = 10.dp)
                                 ) {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                    ) {
-                                        StatCounterChip(
-                                            count = items.size,
-                                            label = "Всего",
-                                            accent = MaterialTheme.colorScheme.onSurface,
-                                            modifier = Modifier.weight(1f),
-                                            onClick = {
-                                                selectedTab = FilterTab.ALL
-                                                showListSheet = true
-                                            }
-                                        )
-                                        StatCounterChip(
-                                            count = expiredCount,
-                                            label = "Просрочка",
-                                            accent = Color(0xFFEF4444),
-                                            modifier = Modifier.weight(1f),
-                                            onClick = {
-                                                selectedTab = FilterTab.EXPIRED
-                                                showListSheet = true
-                                            }
-                                        )
-                                        StatCounterChip(
-                                            count = noDateCount,
-                                            label = "Без даты",
-                                            accent = Color(0xFFF59E0B),
-                                            modifier = Modifier.weight(1f),
-                                            onClick = {
-                                                selectedTab = FilterTab.NO_DATE
-                                                showListSheet = true
-                                            }
-                                        )
-                                    }
-
-                                    Spacer(Modifier.height(8.dp))
-
                                     ActiveScanBannerCard(
                                         item = activeItem,
                                         isDuplicate = isDuplicateBanner,
                                         isExpired = isExpired(activeItem?.expDate) || activeItem?.status == "RETIRED",
-                                        today = today,
-                                        thresholdDate = thresholdDate,
+                                        todayMillis = todayMillis,
+                                        thresholdMillis = thresholdMillis,
                                         fifoBarEnabled = fifoBarEnabled,
-                                        isTsdLarge = false,
-                                        onClick = { showListSheet = true }
+                                        isTsdLarge = true
                                     )
+
+                                    Spacer(Modifier.height(8.dp))
+
+                                    ScannedListSection(
+                                        items = items,
+                                        selectedTab = selectedTab,
+                                        onSelectTab = { selectedTab = it },
+                                        searchQuery = searchQuery,
+                                        onSearchChange = { searchQuery = it },
+                                        groupByName = groupByName,
+                                        onToggleGroup = {
+                                            groupByName = it
+                                            storage.groupByName = it
+                                        },
+                                        expandedGroups = expandedGroups,
+                                        onToggleGroupExpand = { key ->
+                                            expandedGroups = if (key in expandedGroups) expandedGroups - key else expandedGroups + key
+                                        },
+                                        isExpiredFn = { isExpired(it.expDate) || it.status == "RETIRED" },
+                                        todayMillis = todayMillis,
+                                        thresholdMillis = thresholdMillis,
+                                        fifoBarEnabled = fifoBarEnabled,
+                                        onDeleteItem = { key -> updateItems(items.filterNot { it.uniqueKey == key }) },
+                                        onExportExpiredCsv = {
+                                            csvContentToSave = buildCsv(items.filter { isExpired(it.expDate) || it.status == "RETIRED" }, thresholdMillis)
+                                            csvLauncher.launch("AOR_Prosrochka_${formatIsoFileDate()}.csv")
+                                        },
+                                        onExportAllCsv = {
+                                            csvContentToSave = buildCsv(items, thresholdMillis)
+                                            csvLauncher.launch("AOR_Reviziya_${formatIsoFileDate()}.csv")
+                                        },
+                                        onCopySummary = {
+                                            val txt = buildMessengerSummary(items, thresholdMillis) { isExpired(it.expDate) || it.status == "RETIRED" }
+                                            clipboard.setText(AnnotatedString(txt))
+                                            Toast.makeText(context, "Сводка скопирована для мессенджера", Toast.LENGTH_SHORT).show()
+                                        },
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                }
+                            } else {
+                                Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                                    if (hasCameraPermission) {
+                                        CameraScannerView(
+                                            zoomPresetIndex = zoomPresetIndex,
+                                            torchEnabled = torchEnabled,
+                                            fullFrameScan = fullFrameScan,
+                                            onBarcodeScanned = ::onRawBarcodeDetected
+                                        )
+                                    } else {
+                                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                            Button(onClick = { permissionLauncher.launch(Manifest.permission.CAMERA) }) {
+                                                Text("Разрешить доступ к камере")
+                                            }
+                                        }
+                                    }
+
+                                    Column(
+                                        modifier = Modifier
+                                            .align(Alignment.BottomCenter)
+                                            .fillMaxWidth()
+                                            .background(MaterialTheme.colorScheme.background.copy(alpha = 0.92f))
+                                            .navigationBarsPadding()
+                                            .padding(10.dp)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            StatCounterChip(
+                                                count = items.size,
+                                                label = "Всего ↗",
+                                                accent = MaterialTheme.colorScheme.onSurface,
+                                                modifier = Modifier.weight(1f),
+                                                onClick = {
+                                                    selectedTab = FilterTab.ALL
+                                                    showListScreen = true
+                                                }
+                                            )
+                                            StatCounterChip(
+                                                count = expiredCount,
+                                                label = "Просрочка ↗",
+                                                accent = Color(0xFFEF4444),
+                                                modifier = Modifier.weight(1f),
+                                                onClick = {
+                                                    selectedTab = FilterTab.EXPIRED
+                                                    showListScreen = true
+                                                }
+                                            )
+                                            StatCounterChip(
+                                                count = noDateCount,
+                                                label = "Без даты ↗",
+                                                accent = Color(0xFFF59E0B),
+                                                modifier = Modifier.weight(1f),
+                                                onClick = {
+                                                    selectedTab = FilterTab.NO_DATE
+                                                    showListScreen = true
+                                                }
+                                            )
+                                        }
+
+                                        Spacer(Modifier.height(8.dp))
+
+                                        ActiveScanBannerCard(
+                                            item = activeItem,
+                                            isDuplicate = isDuplicateBanner,
+                                            isExpired = isExpired(activeItem?.expDate) || activeItem?.status == "RETIRED",
+                                            todayMillis = todayMillis,
+                                            thresholdMillis = thresholdMillis,
+                                            fifoBarEnabled = fifoBarEnabled,
+                                            isTsdLarge = false,
+                                            onClick = { showListScreen = true }
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -857,52 +997,6 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
                     if (isShelfLocked) {
                         ShelfLockOverlay(onUnlock = { isShelfLocked = false })
                     }
-                }
-            }
-
-            if (showListSheet && !tsdMode) {
-                ModalBottomSheet(
-                    onDismissRequest = { showListSheet = false },
-                    containerColor = MaterialTheme.colorScheme.background,
-                    modifier = Modifier.fillMaxHeight(0.92f)
-                ) {
-                    ScannedListSection(
-                        items = items,
-                        selectedTab = selectedTab,
-                        onSelectTab = { selectedTab = it },
-                        searchQuery = searchQuery,
-                        onSearchChange = { searchQuery = it },
-                        groupByName = groupByName,
-                        onToggleGroup = {
-                            groupByName = it
-                            storage.groupByName = it
-                        },
-                        expandedGroups = expandedGroups,
-                        onToggleGroupExpand = { key ->
-                            expandedGroups = if (key in expandedGroups) expandedGroups - key else expandedGroups + key
-                        },
-                        isExpiredFn = { isExpired(it.expDate) || it.status == "RETIRED" },
-                        today = today,
-                        thresholdDate = thresholdDate,
-                        fifoBarEnabled = fifoBarEnabled,
-                        onDeleteItem = { key -> updateItems(items.filterNot { it.uniqueKey == key }) },
-                        onExportExpiredCsv = {
-                            csvContentToSave = buildCsv(items.filter { isExpired(it.expDate) || it.status == "RETIRED" }, thresholdDate)
-                            csvLauncher.launch("AOR_Prosrochka_${LocalDate.now()}.csv")
-                        },
-                        onExportAllCsv = {
-                            csvContentToSave = buildCsv(items, thresholdDate)
-                            csvLauncher.launch("AOR_Reviziya_${LocalDate.now()}.csv")
-                        },
-                        onCopySummary = {
-                            val txt = buildMessengerSummary(items, thresholdDate) { isExpired(it.expDate) || it.status == "RETIRED" }
-                            clipboard.setText(AnnotatedString(txt))
-                            Toast.makeText(context, "Сводка скопирована для мессенджера", Toast.LENGTH_SHORT).show()
-                        },
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(horizontal = 12.dp)
-                    )
                 }
             }
 
@@ -967,7 +1061,7 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
 
 @Composable
 private fun TopControlHeader(
-    thresholdDate: LocalDate,
+    thresholdMillis: Long,
     offsetDays: Int,
     onSelectOffset: (Int) -> Unit,
     tsdMode: Boolean,
@@ -981,7 +1075,6 @@ private fun TopControlHeader(
     onLockScreen: () -> Unit,
     onRequestReset: () -> Unit
 ) {
-    val fmt = remember { DateTimeFormatter.ofPattern("dd.MM") }
     val zoomLabel = when (zoomPresetIndex) {
         0 -> "0.6x"
         1 -> "1x"
@@ -1013,8 +1106,9 @@ private fun TopControlHeader(
                 color = MaterialTheme.colorScheme.surfaceVariant,
                 modifier = Modifier.weight(1f)
             ) {
+                val dateStr = formatShortDayMonth(thresholdMillis)
                 Text(
-                    text = if (tsdMode) "ТСД • До ${thresholdDate.format(fmt)}" else "До ${thresholdDate.format(fmt)}",
+                    text = if (tsdMode) "ТСД • До $dateStr" else "До $dateStr",
                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
                     fontWeight = FontWeight.Bold,
                     fontSize = 13.sp,
@@ -1114,8 +1208,8 @@ private fun ActiveScanBannerCard(
     item: ScannedItem?,
     isDuplicate: Boolean,
     isExpired: Boolean,
-    today: LocalDate,
-    thresholdDate: LocalDate,
+    todayMillis: Long,
+    thresholdMillis: Long,
     fifoBarEnabled: Boolean,
     isTsdLarge: Boolean,
     onClick: (() -> Unit)? = null
@@ -1230,7 +1324,7 @@ private fun ActiveScanBannerCard(
 
             if (fifoBarEnabled && item.expDate != null) {
                 Spacer(Modifier.height(6.dp))
-                FifoFreshnessBar(expDateIso = item.expDate, today = today, thresholdDate = thresholdDate)
+                FifoFreshnessBar(expDateIso = item.expDate, todayMillis = todayMillis, thresholdMillis = thresholdMillis)
             }
         }
     }
@@ -1263,15 +1357,11 @@ private fun StatCounterChip(
 // ==================== ШКАЛА СВЕЖЕСТИ FIFO ====================
 
 @Composable
-private fun FifoFreshnessBar(expDateIso: String, today: LocalDate, thresholdDate: LocalDate) {
-    val parsed = try {
-        LocalDate.parse(expDateIso.take(10))
-    } catch (_: Exception) {
-        return
-    }
-    val daysLeft = ChronoUnit.DAYS.between(today, parsed)
+private fun FifoFreshnessBar(expDateIso: String, todayMillis: Long, thresholdMillis: Long) {
+    val expMs = parseIsoToMillis(expDateIso) ?: return
+    val daysLeft = ((expMs - todayMillis) / 86_400_000L).toInt()
     val (barColor, fraction, label) = when {
-        !parsed.isAfter(thresholdDate) -> Triple(Color(0xFFEF4444), 1.0f, "Списать")
+        expMs <= thresholdMillis -> Triple(Color(0xFFEF4444), 1.0f, "Списать")
         daysLeft <= 3 -> Triple(Color(0xFFF59E0B), 0.65f, "Ротация ($daysLeft дн.)")
         else -> Triple(Color(0xFF10B981), 0.35f, "Запас ($daysLeft дн.)")
     }
@@ -1310,8 +1400,8 @@ private fun ScannedListSection(
     expandedGroups: Set<String>,
     onToggleGroupExpand: (String) -> Unit,
     isExpiredFn: (ScannedItem) -> Boolean,
-    today: LocalDate,
-    thresholdDate: LocalDate,
+    todayMillis: Long,
+    thresholdMillis: Long,
     fifoBarEnabled: Boolean,
     onDeleteItem: (String) -> Unit,
     onExportExpiredCsv: () -> Unit,
@@ -1319,7 +1409,7 @@ private fun ScannedListSection(
     onCopySummary: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val filtered = remember(items, selectedTab, searchQuery, thresholdDate) {
+    val filtered = remember(items, selectedTab, searchQuery, thresholdMillis) {
         items.filter { item ->
             val tabMatch = when (selectedTab) {
                 FilterTab.ALL -> true
@@ -1460,8 +1550,8 @@ private fun ScannedListSection(
                                     SingleUnitRow(
                                         item = subItem,
                                         expired = isExpiredFn(subItem),
-                                        today = today,
-                                        thresholdDate = thresholdDate,
+                                        todayMillis = todayMillis,
+                                        thresholdMillis = thresholdMillis,
                                         fifoBarEnabled = fifoBarEnabled,
                                         compact = true,
                                         onDelete = { onDeleteItem(subItem.uniqueKey) }
@@ -1477,8 +1567,8 @@ private fun ScannedListSection(
                     SingleUnitRow(
                         item = item,
                         expired = isExpiredFn(item),
-                        today = today,
-                        thresholdDate = thresholdDate,
+                        todayMillis = todayMillis,
+                        thresholdMillis = thresholdMillis,
                         fifoBarEnabled = fifoBarEnabled,
                         compact = false,
                         onDelete = { onDeleteItem(item.uniqueKey) }
@@ -1529,8 +1619,8 @@ private fun ScannedListSection(
 private fun SingleUnitRow(
     item: ScannedItem,
     expired: Boolean,
-    today: LocalDate,
-    thresholdDate: LocalDate,
+    todayMillis: Long,
+    thresholdMillis: Long,
     fifoBarEnabled: Boolean,
     compact: Boolean,
     onDelete: () -> Unit
@@ -1588,7 +1678,7 @@ private fun SingleUnitRow(
 
                 if (fifoBarEnabled && item.expDate != null && !compact) {
                     Spacer(Modifier.height(5.dp))
-                    FifoFreshnessBar(expDateIso = item.expDate, today = today, thresholdDate = thresholdDate)
+                    FifoFreshnessBar(expDateIso = item.expDate, todayMillis = todayMillis, thresholdMillis = thresholdMillis)
                 }
             }
 
@@ -1717,16 +1807,25 @@ private fun DrawerSettingsContent(
         Spacer(Modifier.height(8.dp))
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-            FilterChip(
-                selected = apiMode == "mobile_api",
-                onClick = { onApiModeChange("mobile_api") },
-                label = { Text("Mobile API", fontSize = 12.sp) }
-            )
-            FilterChip(
-                selected = apiMode == "true_api",
-                onClick = { onApiModeChange("true_api") },
-                label = { Text("True API", fontSize = 12.sp) }
-            )
+            listOf("mobile_api" to "Mobile API", "true_api" to "True API").forEach { (mKey, mLabel) ->
+                val active = apiMode == mKey
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
+                    modifier = Modifier
+                        .weight(1f)
+                        .clickable { onApiModeChange(mKey) }
+                ) {
+                    Text(
+                        text = mLabel,
+                        modifier = Modifier.padding(vertical = 8.dp),
+                        textAlign = TextAlign.Center,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (active) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
+                    )
+                }
+            }
         }
 
         if (apiMode == "true_api") {
@@ -1868,7 +1967,9 @@ private fun ManualAddItemDialog(
     onAdd: (name: String, expIso: String?, qty: Int) -> Unit
 ) {
     var name by remember { mutableStateOf("") }
-    var dateInput by remember { mutableStateOf(LocalDate.now().format(DateTimeFormatter.ofPattern("dd.MM.yyyy"))) }
+    var dateInput by remember {
+        mutableStateOf(SimpleDateFormat("dd.MM.yyyy", Locale.getDefault()).format(Date()))
+    }
     var qtyInput by remember { mutableStateOf("1") }
 
     AlertDialog(
@@ -1886,10 +1987,17 @@ private fun ManualAddItemDialog(
                 if (existingNames.isNotEmpty()) {
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         existingNames.take(2).forEach { suggestion ->
-                            SuggestionChip(
-                                onClick = { name = suggestion },
-                                label = { Text(suggestion.take(18), fontSize = 11.sp) }
-                            )
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant,
+                                modifier = Modifier.clickable { name = suggestion }
+                            ) {
+                                Text(
+                                    text = suggestion.take(18),
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                    fontSize = 11.sp
+                                )
+                            }
                         }
                     }
                 }
@@ -1937,7 +2045,7 @@ private fun CameraScannerView(
     onBarcodeScanned: (String) -> Unit
 ) {
     val context = LocalContext.current
-    val lifecycleOwner = LocalLifecycleOwner.current
+    val lifecycleOwner = context as LifecycleOwner
     val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
     var cameraRef by remember { mutableStateOf<Camera?>(null) }
 
@@ -2124,38 +2232,20 @@ private suspend fun fetchFromGateway(
     }
 }
 
-// ==================== ФОРМАТИРОВАНИЕ ДАТ И ОТЧЁТОВ ====================
+// ==================== ФОРМАТИРОВАНИЕ ОТЧЁТОВ ====================
 
-private fun formatRuDate(iso: String?): String {
-    if (iso.isNullOrBlank()) return "—"
-    return try {
-        val d = LocalDate.parse(iso.take(10))
-        d.format(DateTimeFormatter.ofPattern("dd.MM.yyyy"))
-    } catch (_: Exception) {
-        iso
-    }
-}
-
-private fun parseRuToIso(ru: String): String? {
-    return try {
-        val d = LocalDate.parse(ru.trim(), DateTimeFormatter.ofPattern("dd.MM.yyyy"))
-        d.toString()
-    } catch (_: Exception) {
-        null
-    }
-}
-
-private fun buildCsv(list: List<ScannedItem>, thresholdDate: LocalDate): String {
+private fun buildCsv(list: List<ScannedItem>, thresholdMillis: Long): String {
     val sb = StringBuilder()
     sb.appendLine("Наименование;GTIN;Серийный номер;Срок годности;Статус;Порог проверки")
-    val thrStr = thresholdDate.format(DateTimeFormatter.ofPattern("dd.MM.yyyy"))
+    val thrStr = SimpleDateFormat("dd.MM.yyyy", Locale.getDefault()).format(Date(thresholdMillis))
     for (it in list) {
         val cleanName = (it.name ?: "Не определено").replace(";", ",")
         val expStr = formatRuDate(it.expDate)
+        val expMs = parseIsoToMillis(it.expDate)
         val statusStr = when {
             it.status == "RETIRED" -> "ВЫБЫЛ"
-            it.expDate != null && !LocalDate.parse(it.expDate.take(10)).isAfter(thresholdDate) -> "ПРОСРОЧКА"
-            it.expDate != null -> "ГОДЕН"
+            expMs != null && expMs <= thresholdMillis -> "ПРОСРОЧКА"
+            expMs != null -> "ГОДЕН"
             else -> it.infoMsg ?: "БЕЗ ДАТЫ"
         }
         sb.appendLine("$cleanName;\"${it.gtin}\";\"${it.sn}\";$expStr;$statusStr;$thrStr")
@@ -2165,11 +2255,11 @@ private fun buildCsv(list: List<ScannedItem>, thresholdDate: LocalDate): String 
 
 private fun buildMessengerSummary(
     list: List<ScannedItem>,
-    thresholdDate: LocalDate,
+    thresholdMillis: Long,
     isExpiredFn: (ScannedItem) -> Boolean
 ): String {
-    val nowStr = LocalDateTime.now().format(DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm"))
-    val thrStr = thresholdDate.format(DateTimeFormatter.ofPattern("dd.MM.yyyy"))
+    val nowStr = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(Date())
+    val thrStr = SimpleDateFormat("dd.MM.yyyy", Locale.getDefault()).format(Date(thresholdMillis))
     val expired = list.filter(isExpiredFn)
 
     val sb = StringBuilder()
