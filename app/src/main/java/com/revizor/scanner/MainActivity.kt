@@ -1,5 +1,7 @@
 package com.revizor.scanner
 
+@file:OptIn(ExperimentalMaterial3Api::class)
+
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.BroadcastReceiver
@@ -28,7 +30,6 @@ import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
@@ -44,7 +45,13 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -81,7 +88,6 @@ import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.time.temporal.ChronoUnit
-import java.util.Locale
 import java.util.concurrent.Executors
 import kotlin.random.Random
 
@@ -135,7 +141,6 @@ object CrptParser {
 
         if (cleaned.length < 18) return null
 
-        // Ищем AI 01 (14 цифр GTIN) + AI 21 (серийный номер)
         val startIdx = if (cleaned.startsWith("01")) 0 else cleaned.indexOf("01")
         if (startIdx == -1 || cleaned.length < startIdx + 18) return null
 
@@ -150,7 +155,6 @@ object CrptParser {
         val sn = if (gsIdx != -1) {
             snPart.substring(0, gsIdx)
         } else {
-            // Если сканер обрезал GS, отсекаем известные крипто-хвосты 91/92/93
             val tailMatch = Regex("(91[0-9A-Za-z]{4}|92[0-9A-Za-z]{10,}|93[0-9A-Za-z]{4})").find(snPart)
             if (tailMatch != null && tailMatch.range.first >= 4) {
                 snPart.substring(0, tailMatch.range.first)
@@ -232,7 +236,7 @@ class AppStorage(context: Context) {
                 put("expDate", it.expDate ?: JSONObject.NULL)
                 put("status", it.status ?: JSONObject.NULL)
                 put("infoMsg", it.infoMsg ?: JSONObject.NULL)
-                put("isLoading", false) // После перезапуска не зависаем в вечной загрузке
+                put("isLoading", false)
                 put("isManual", it.isManual)
                 put("scannedAt", it.scannedAt)
             }
@@ -286,7 +290,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Перехват аппаратного сканера в режиме эмуляции клавиатуры (HID / Keyboard Wedge)
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (event.action == KeyEvent.ACTION_DOWN) {
             val now = System.currentTimeMillis()
@@ -342,14 +345,12 @@ private val LightScheme = lightColorScheme(
 
 // ==================== ОСНОВНОЙ UI ПРИЛОЖЕНИЯ ====================
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AorScannerApp(hardwareScanFlow: Channel<String>) {
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
     val storage = remember { AppStorage(context) }
 
-    // Персистентные состояния
     var items by remember { mutableStateOf(storage.loadItems()) }
     var soundEnabled by remember { mutableStateOf(storage.soundEnabled) }
     var tsdMode by remember { mutableStateOf(storage.tsdMode) }
@@ -364,7 +365,6 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
     var apiMode by remember { mutableStateOf(storage.apiMode) }
     var apiToken by remember { mutableStateOf(storage.apiToken) }
 
-    // Оперативные состояния экрана
     var showListSheet by remember { mutableStateOf(false) }
     var activeBannerKey by remember { mutableStateOf<String?>(null) }
     var isDuplicateBanner by remember { mutableStateOf(false) }
@@ -373,7 +373,6 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
     var showResetConfirm by remember { mutableStateOf(false) }
     var showManualAddDialog by remember { mutableStateOf(false) }
 
-    // Состояния камеры
     var hasCameraPermission by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
@@ -385,9 +384,8 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
 
     var torchEnabled by remember { mutableStateOf(false) }
     var fullFrameScan by remember { mutableStateOf(false) }
-    var zoomPresetIndex by remember { mutableIntStateOf(1) } // 0 = 0.6x (макро), 1 = 1x, 2 = 2x, 3 = 3x
+    var zoomPresetIndex by remember { mutableIntStateOf(1) }
 
-    // Фильтры списка
     var selectedTab by remember { mutableStateOf(FilterTab.ALL) }
     var searchQuery by remember { mutableStateOf("") }
     var expandedGroups by remember { mutableStateOf(setOf<String>()) }
@@ -399,24 +397,21 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
     val today = remember { LocalDate.now() }
     val thresholdDate = remember(today, offsetDays) { today.plusDays(offsetDays.toLong()) }
 
-    // Хелпер проверки просрочки
     fun isExpired(expIso: String?): Boolean {
         if (expIso.isNullOrBlank()) return false
         return try {
             val d = LocalDate.parse(expIso.take(10))
-            !d.isAfter(thresholdDate) // <= thresholdDate
+            !d.isAfter(thresholdDate)
         } catch (_: Exception) {
             false
         }
     }
 
-    // Сохранение списка при любом изменении
     fun updateItems(newList: List<ScannedItem>) {
         items = newList
         storage.saveItems(newList)
     }
 
-    // Обратная связь: вибрация + звук + цветовая вспышка
     val toneGen = remember {
         try {
             ToneGenerator(AudioManager.STREAM_ALARM, 90)
@@ -468,7 +463,6 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
         }
     }
 
-    // Обработка входящего скана (с камеры или с ТСД)
     var lastScanStamp by remember { mutableStateOf("" to 0L) }
 
     fun onRawBarcodeDetected(rawText: String) {
@@ -481,7 +475,6 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
 
         val existing = items.find { it.uniqueKey == parsed.uniqueKey }
         if (existing != null) {
-            // Повторное наведение: сразу показываем срок годности из списка на экране!
             activeBannerKey = existing.uniqueKey
             isDuplicateBanner = true
             triggerFeedback(expired = isExpired(existing.expDate), isDuplicate = true)
@@ -501,7 +494,6 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
         apiQueue.trySend(parsed)
     }
 
-    // Очередь запросов к API с троттлингом 350мс и автоповтором при сбоях связи / 429
     LaunchedEffect(Unit) {
         for (task in apiQueue) {
             delay(350L + Random.nextLong(50L, 140L))
@@ -551,7 +543,6 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
         }
     }
 
-    // Приём кодов от аппаратного сканера ТСД (Broadcast Intent ScanTool / Seuic AutoID Q9C + HID)
     LaunchedEffect(Unit) {
         for (hwCode in hardwareScanFlow) {
             onRawBarcodeDetected(hwCode)
@@ -562,7 +553,7 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(ctx: Context?, intent: Intent?) {
                 if (intent == null) return
-                val code = intent.getStringExtra("scannerdata") // MERTECH Seuic AutoID Q9C (ScanTool)
+                val code = intent.getStringExtra("scannerdata")
                     ?: intent.getStringExtra("barcode_string")
                     ?: intent.getStringExtra("data")
                     ?: intent.getStringExtra("SCAN_BARCODE1")
@@ -573,25 +564,28 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
             }
         }
         val filter = IntentFilter().apply {
-            addAction("com.android.server.scannerservice.broadcast") // Seuic ScanTool
+            addAction("com.android.server.scannerservice.broadcast")
             addAction("android.intent.ACTION_DECODE_DATA")
             addAction("nlscan.action.SCANNER_RESULT")
             addAction("com.scanner.broadcast")
         }
-        ContextCompat.registerReceiver(context, receiver, filter, ContextCompat.RECEIVER_EXPORTED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            context.registerReceiver(receiver, filter)
+        }
         onDispose {
             context.unregisterReceiver(receiver)
         }
     }
 
-    // Запрос разрешения на камеру только если не в режиме ТСД
     LaunchedEffect(tsdMode) {
         if (!tsdMode && !hasCameraPermission) {
             permissionLauncher.launch(Manifest.permission.CAMERA)
         }
     }
 
-    // Лаунчеры сохранения CSV файлов
     var csvContentToSave by remember { mutableStateOf("") }
     val csvLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("text/csv")
@@ -600,7 +594,7 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
             try {
                 context.contentResolver.openOutputStream(uri)?.use { out ->
                     OutputStreamWriter(out, StandardCharsets.UTF_8).use { writer ->
-                        writer.write("\uFEFF") // UTF-8 BOM для Excel
+                        writer.write("\uFEFF")
                         writer.write(csvContentToSave)
                     }
                 }
@@ -611,7 +605,6 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
         }
     }
 
-    // Применяем тему и масштаб шрифта
     val colors = if (darkTheme) DarkScheme else LightScheme
     val baseDensity = LocalDensity.current
     val scaledDensity = remember(baseDensity, largeFont) {
@@ -695,7 +688,6 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
                         .background(MaterialTheme.colorScheme.background)
                 ) {
                     Column(modifier = Modifier.fillMaxSize()) {
-                        // ===== ВЕРХНЯЯ ПАНЕЛЬ УПРАВЛЕНИЯ =====
                         TopControlHeader(
                             thresholdDate = thresholdDate,
                             offsetDays = offsetDays,
@@ -717,13 +709,11 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
                             }
                         )
 
-                        // ===== ОСНОВНАЯ РАБОЧАЯ ОБЛАСТЬ =====
                         val activeItem = items.find { it.uniqueKey == activeBannerKey } ?: items.firstOrNull()
                         val expiredCount = items.count { isExpired(it.expDate) || it.status == "RETIRED" }
                         val noDateCount = items.count { it.expDate == null && !it.isLoading }
 
                         if (tsdMode) {
-                            // РЕЖИМ ТСД (БЕЗ КАМЕРЫ): Крупная плашка последнего скана + Сразу весь список
                             Column(
                                 modifier = Modifier
                                     .fillMaxSize()
@@ -778,7 +768,6 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
                                 )
                             }
                         } else {
-                            // РЕЖИМ СМАРТФОНА (КАМЕРА + НИЖНИЙ HUD)
                             Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
                                 if (hasCameraPermission) {
                                     CameraScannerView(
@@ -795,7 +784,6 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
                                     }
                                 }
 
-                                // Нижняя панель счётчиков и последнего скана
                                 Column(
                                     modifier = Modifier
                                         .align(Alignment.BottomCenter)
@@ -856,7 +844,6 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
                         }
                     }
 
-                    // ===== ПОЛНОЭКРАННАЯ ЦВЕТОВАЯ ВСПЫШКА ПРИ СКАНЕ =====
                     if (flashAlpha > 0f) {
                         val flashColor = if (flashType == FlashType.EXPIRED) Color(0xFFEF4444) else Color(0xFF10B981)
                         Box(
@@ -867,14 +854,12 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
                         )
                     }
 
-                    // ===== «ЗАМОК ОТ ПОЛКИ» (БЛОКИРОВКА СЛУЧАЙНЫХ КАСАНИЙ) =====
                     if (isShelfLocked) {
                         ShelfLockOverlay(onUnlock = { isShelfLocked = false })
                     }
                 }
             }
 
-            // ===== НИЖНИЙ ЛИСТ СО СПИСКОМ (ДЛЯ РЕЖИМА СМАРТФОНА) =====
             if (showListSheet && !tsdMode) {
                 ModalBottomSheet(
                     onDismissRequest = { showListSheet = false },
@@ -921,7 +906,6 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
                 }
             }
 
-            // ===== ПОДТВЕРЖДЕНИЕ СБРОСА СПИСКА =====
             if (showResetConfirm) {
                 AlertDialog(
                     onDismissRequest = { showResetConfirm = false },
@@ -946,7 +930,6 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
                 )
             }
 
-            // ===== ДИАЛОГ РУЧНОГО ДОБАВЛЕНИЯ ПОЗИЦИИ =====
             if (showManualAddDialog) {
                 ManualAddItemDialog(
                     existingNames = items.mapNotNull { it.name }.distinct(),
@@ -1013,7 +996,6 @@ private fun TopControlHeader(
             .statusBarsPadding()
             .padding(horizontal = 8.dp, vertical = 6.dp)
     ) {
-        // Ряд 1: Меню, Порог даты, Инструменты камеры/Замок, Сброс
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -1047,18 +1029,15 @@ private fun TopControlHeader(
                     text = if (fullFrameScan) "Весь" else "Центр",
                     onClick = onToggleScanArea
                 )
-                IconButton(
-                    onClick = onToggleTorch,
-                    modifier = Modifier
-                        .size(34.dp)
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(if (torchEnabled) Color(0xFFF59E0B) else MaterialTheme.colorScheme.surfaceVariant)
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = if (torchEnabled) Color(0xFFF59E0B) else MaterialTheme.colorScheme.surfaceVariant,
+                    modifier = Modifier.clickable(onClick = onToggleTorch)
                 ) {
-                    Icon(
-                        imageVector = if (torchEnabled) Icons.Default.FlashOn else Icons.Default.FlashOff,
-                        contentDescription = "Фонарик",
-                        tint = if (torchEnabled) Color.Black else MaterialTheme.colorScheme.onSurface,
-                        modifier = Modifier.size(18.dp)
+                    Text(
+                        text = "🔦",
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                        fontSize = 13.sp
                     )
                 }
             }
@@ -1083,7 +1062,6 @@ private fun TopControlHeader(
 
         Spacer(Modifier.height(6.dp))
 
-        // Ряд 2: Быстрые пресеты дат
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -1359,13 +1337,12 @@ private fun ScannedListSection(
     }
 
     Column(modifier = modifier) {
-        // Вкладки фильтров + переключатель группировки
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(5.dp)
         ) {
-            FilterTab.entries.forEach { tab ->
+            FilterTab.values().forEach { tab ->
                 val active = selectedTab == tab
                 Surface(
                     shape = RoundedCornerShape(8.dp),
@@ -1384,36 +1361,23 @@ private fun ScannedListSection(
 
             Spacer(Modifier.weight(1f))
 
-            // Кнопка группировки (аккордеон по наименованию)
             Surface(
                 shape = RoundedCornerShape(8.dp),
                 color = if (groupByName) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
                 modifier = Modifier.clickable { onToggleGroup(!groupByName) }
             ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.FolderOpen,
-                        contentDescription = "Группировка",
-                        modifier = Modifier.size(14.dp),
-                        tint = if (groupByName) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
-                    )
-                    Spacer(Modifier.width(4.dp))
-                    Text(
-                        text = "Группы",
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = if (groupByName) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
-                    )
-                }
+                Text(
+                    text = "Группы",
+                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = if (groupByName) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
+                )
             }
         }
 
         Spacer(Modifier.height(6.dp))
 
-        // Поле поиска
         OutlinedTextField(
             value = searchQuery,
             onValueChange = onSearchChange,
@@ -1432,7 +1396,6 @@ private fun ScannedListSection(
 
         Spacer(Modifier.height(6.dp))
 
-        // Список (обычный или сгруппированный аккордеон)
         LazyColumn(
             modifier = Modifier.weight(1f),
             verticalArrangement = Arrangement.spacedBy(6.dp),
@@ -1483,7 +1446,7 @@ private fun ScannedListSection(
                                     }
                                 }
                                 Icon(
-                                    imageVector = if (isExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                                    imageVector = if (isExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
                                     contentDescription = "Раскрыть",
                                     tint = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -1491,7 +1454,7 @@ private fun ScannedListSection(
 
                             if (isExpanded) {
                                 Spacer(Modifier.height(8.dp))
-                                HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+                                Divider(color = MaterialTheme.colorScheme.outline)
                                 Spacer(Modifier.height(6.dp))
                                 groupItems.forEach { subItem ->
                                     SingleUnitRow(
@@ -1524,7 +1487,6 @@ private fun ScannedListSection(
             }
         }
 
-        // Нижние кнопки выгрузки отчётов
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1682,7 +1644,6 @@ private fun DrawerSettingsContent(
 
         Spacer(Modifier.height(12.dp))
 
-        // 1. Режим ТСД
         DrawerSectionTitle("Оборудование")
         DrawerSwitchRow(
             title = "Режим ТСД (без камеры)",
@@ -1691,9 +1652,8 @@ private fun DrawerSettingsContent(
             onCheckedChange = onTsdModeChange
         )
 
-        HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+        Divider(modifier = Modifier.padding(vertical = 8.dp))
 
-        // 2. Внешний вид и индикация
         DrawerSectionTitle("Дизайн и индикация")
         DrawerSwitchRow(
             title = "Тёмная тема (AMOLED)",
@@ -1720,9 +1680,8 @@ private fun DrawerSettingsContent(
             onCheckedChange = onFifoBarEnabledChange
         )
 
-        HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+        Divider(modifier = Modifier.padding(vertical = 8.dp))
 
-        // 3. Звук и инструменты
         DrawerSectionTitle("Звук и ввод")
         DrawerSwitchRow(
             title = "Звуковой сигнал",
@@ -1743,9 +1702,8 @@ private fun DrawerSettingsContent(
             Text("Добавить позицию вручную")
         }
 
-        HorizontalDivider(modifier = Modifier.padding(vertical = 10.dp))
+        Divider(modifier = Modifier.padding(vertical = 10.dp))
 
-        // 4. Настройки API / Шлюз ЧЗ
         DrawerSectionTitle("Настройки API / Шлюз ЧЗ")
         OutlinedTextField(
             value = apiUrl,
@@ -1793,12 +1751,10 @@ private fun DrawerSettingsContent(
             Text("Сохранить параметры API")
         }
 
-        Spacer(Modifier.weight(1f))
-        Spacer(Modifier.height(20.dp))
-        HorizontalDivider()
+        Spacer(Modifier.height(24.dp))
+        Divider()
         Spacer(Modifier.height(12.dp))
 
-        // Подпись бренда и версия
         Column(
             modifier = Modifier.fillMaxWidth(),
             horizontalAlignment = Alignment.CenterHorizontally
@@ -1988,17 +1944,15 @@ private fun CameraScannerView(
     val latestFullFrame by rememberUpdatedState(fullFrameScan)
     val latestCallback by rememberUpdatedState(onBarcodeScanned)
 
-    // Управление фонариком
     LaunchedEffect(cameraRef, torchEnabled) {
         cameraRef?.cameraControl?.enableTorch(torchEnabled)
     }
 
-    // Управление зумом (включая макро 0.6x через минимальный зум камеры)
     LaunchedEffect(cameraRef, zoomPresetIndex) {
         val cam = cameraRef ?: return@LaunchedEffect
         val zoomState = cam.cameraInfo.zoomState.value ?: return@LaunchedEffect
         val targetRatio = when (zoomPresetIndex) {
-            0 -> zoomState.minZoomRatio.coerceAtLeast(0.5f) // Ширик / Макро 0.6x
+            0 -> zoomState.minZoomRatio.coerceAtLeast(0.5f)
             1 -> 1.0f.coerceIn(zoomState.minZoomRatio, zoomState.maxZoomRatio)
             2 -> 2.0f.coerceIn(zoomState.minZoomRatio, zoomState.maxZoomRatio)
             else -> 3.0f.coerceIn(zoomState.minZoomRatio, zoomState.maxZoomRatio)
@@ -2035,7 +1989,6 @@ private fun CameraScannerView(
                         val mediaImage = imageProxy.image
                         if (mediaImage != null) {
                             if (!latestFullFrame) {
-                                // Обрезка центральной зоны для точного прицеливания в банки
                                 val w = mediaImage.width
                                 val h = mediaImage.height
                                 val cropSize = (minOf(w, h) * 0.56f).toInt()
@@ -2076,7 +2029,6 @@ private fun CameraScannerView(
             modifier = Modifier.fillMaxSize()
         )
 
-        // Визуальная рамка прицела (в режиме "Центр")
         if (!fullFrameScan) {
             Box(
                 modifier = Modifier
