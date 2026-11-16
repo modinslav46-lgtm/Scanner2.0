@@ -54,6 +54,9 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
@@ -307,6 +310,10 @@ class MainActivity : ComponentActivity() {
     private var searchQuery = ""
     private val expandedGroups = mutableSetOf<String>()
 
+    // Системные отступы (статус-бар и навигация)
+    private var sysTopInset = 0
+    private var sysBottomInset = 0
+
     private var lastScanKey = ""
     private var lastScanTime = 0L
 
@@ -373,6 +380,7 @@ class MainActivity : ComponentActivity() {
     // Боковая шторка
     private lateinit var drawerScrim: View
     private lateinit var drawerPanel: ScrollView
+    private var drawerContentCol: LinearLayout? = null
 
     // CSV экспорт
     private var pendingCsvContent = ""
@@ -421,6 +429,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+
         storage = AppStorage(this)
         items.clear()
         items.addAll(storage.loadItems())
@@ -432,6 +442,7 @@ class MainActivity : ComponentActivity() {
         }
 
         buildUi()
+        setupSystemInsets()
         registerScannerBroadcast()
         startApiWorker()
         refreshAllUi()
@@ -450,6 +461,33 @@ class MainActivity : ComponentActivity() {
         toneGen?.release()
         cameraExecutor.shutdown()
         uiScope.cancel()
+    }
+
+    // ==================== СИСТЕМНЫЕ ОТСТУПЫ (STATUS BAR & NAVIGATION BAR) ====================
+
+    private fun setupSystemInsets() {
+        ViewCompat.setOnApplyWindowInsetsListener(rootFrame) { _, insets ->
+            val sysBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            sysTopInset = sysBars.top
+            sysBottomInset = sysBars.bottom
+            applySystemInsets()
+            insets
+        }
+        ViewCompat.requestApplyInsets(rootFrame)
+    }
+
+    private fun applySystemInsets() {
+        headerContainer.setPadding(dp(8), sysTopInset + dp(8), dp(8), dp(8))
+        bottomHud.setPadding(dp(10), dp(10), dp(10), sysBottomInset + dp(12))
+        listSection.setPadding(dp(10), dp(6), dp(10), sysBottomInset + dp(10))
+        drawerContentCol?.setPadding(dp(16), sysTopInset + dp(18), dp(16), sysBottomInset + dp(24))
+    }
+
+    private fun updateSystemBarIconsColor() {
+        val controller = WindowCompat.getInsetsController(window, window.decorView)
+        val lightIcons = !storage.darkTheme
+        controller.isAppearanceLightStatusBars = lightIcons
+        controller.isAppearanceLightNavigationBars = lightIcons
     }
 
     // ==================== ПЕРЕХВАТ АППАРАТНОГО СКАНЕРА (HID) ====================
@@ -1043,8 +1081,9 @@ class MainActivity : ComponentActivity() {
 
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(18), dp(16), dp(24))
+            setPadding(dp(16), sysTopInset + dp(18), dp(16), sysBottomInset + dp(24))
         }
+        drawerContentCol = col
 
         col.addView(TextView(this).apply {
             text = "Параметры терминала"
@@ -1365,6 +1404,9 @@ class MainActivity : ComponentActivity() {
         val p = palette()
         val tsd = storage.tsdMode
 
+        updateSystemBarIconsColor()
+        applySystemInsets()
+
         rootFrame.setBackgroundColor(p.bg)
         headerContainer.setBackgroundColor(p.surface)
 
@@ -1674,7 +1716,9 @@ class MainActivity : ComponentActivity() {
 
                 for (sub in units) {
                     val subRow = buildSingleCard(sub, p, compact = true)
-                    (subRow.layoutParams as? LinearLayout.LayoutParams)?.bottomMargin = dp(5)
+                    subRow.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                        bottomMargin = dp(5)
+                    }
                     card.addView(subRow)
                 }
             }
