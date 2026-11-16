@@ -121,6 +121,19 @@ data class ThemePalette(
     val primary: Int
 )
 
+sealed class ListRowEntry {
+    data class Single(val item: ScannedItem) : ListRowEntry()
+    data class Group(val title: String, val units: List<ScannedItem>) : ListRowEntry()
+}
+
+data class GatewayResult(
+    val expDate: String?,
+    val name: String?,
+    val status: String?,
+    val error: String?,
+    val shouldRetry: Boolean
+)
+
 // ==================== ПАРСЕР ЧЕСТНОГО ЗНАКА ====================
 
 object CrptParser {
@@ -328,7 +341,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var tvStatExpired: TextView
     private lateinit var tvStatNoDate: TextView
 
-    // Карточка активного скана (используется и в камере, и в ТСД)
+    // Карточка активного скана
     private lateinit var bannerSlotCamera: FrameLayout
     private lateinit var bannerSlotTsd: FrameLayout
     private lateinit var activeBannerCard: LinearLayout
@@ -530,7 +543,6 @@ class MainActivity : ComponentActivity() {
             layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
         }
 
-        // Жест свайпа слева направо для открытия шторки настроек
         val swipeDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onFling(e1: MotionEvent?, e2: MotionEvent, velocityX: Float, velocityY: Float): Boolean {
                 if (isShelfLocked || e1 == null) return false
@@ -620,7 +632,6 @@ class MainActivity : ComponentActivity() {
 
         headerContainer.addView(topRow)
 
-        // Ряд пресетов дат
         val presetsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
@@ -693,7 +704,6 @@ class MainActivity : ComponentActivity() {
         }
         activeBannerCard.addView(tvBannerDate)
 
-        // Шкала свежести FIFO в карточке скана
         fifoContainerBanner = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -755,7 +765,6 @@ class MainActivity : ComponentActivity() {
         }
         cameraSection.addView(tvPermissionHint)
 
-        // Нижняя панель счётчиков + активный скан
         bottomHud = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(10), dp(10), dp(10), dp(12))
@@ -794,7 +803,7 @@ class MainActivity : ComponentActivity() {
         cameraSection.addView(bottomHud)
         mainColumn.addView(cameraSection)
 
-        // ===== 4. ОБЛАСТЬ СПИСКА (И ДЛЯ ТСД, И ДЛЯ ПРОСМОТРА НА ТЕЛЕФОНЕ) =====
+        // ===== 4. ОБЛАСТЬ СПИСКА (ТСД И ПРОСМОТР НА ТЕЛЕФОНЕ) =====
         listSection = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(10), dp(6), dp(10), dp(10))
@@ -802,7 +811,6 @@ class MainActivity : ComponentActivity() {
             visibility = View.GONE
         }
 
-        // Верхняя полоска возврата к камере (показывается только в режиме смартфона)
         phoneListTopBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -825,7 +833,6 @@ class MainActivity : ComponentActivity() {
         phoneListTopBar.addView(btnClearList)
         listSection.addView(phoneListTopBar)
 
-        // Слот для плашки последнего скана в режиме ТСД
         bannerSlotTsd = FrameLayout(this).apply {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 bottomMargin = dp(8)
@@ -833,7 +840,6 @@ class MainActivity : ComponentActivity() {
         }
         listSection.addView(bannerSlotTsd)
 
-        // Вкладки фильтрации + кнопка Группы
         val tabsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -870,7 +876,6 @@ class MainActivity : ComponentActivity() {
         tabsRow.addView(btnGroupToggle)
         listSection.addView(tabsRow)
 
-        // Поле поиска
         etSearch = EditText(this).apply {
             hint = "Поиск по названию, GTIN или SN..."
             isSingleLine = true
@@ -889,7 +894,6 @@ class MainActivity : ComponentActivity() {
         }
         listSection.addView(etSearch)
 
-        // Сам список позиций / аккордеон-групп
         listAdapter = ScanListAdapter()
         listView = ListView(this).apply {
             divider = null
@@ -899,7 +903,6 @@ class MainActivity : ComponentActivity() {
         }
         listSection.addView(listView)
 
-        // Нижние кнопки экспорта
         val exportRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
@@ -1008,7 +1011,7 @@ class MainActivity : ComponentActivity() {
         lockOverlay.addView(lockCard)
         rootFrame.addView(lockOverlay)
 
-        // ===== 7. БОКОВАЯ ШТОРКА НАСТРОЕК (СВАЙП СЛЕВА НАПРАВО) =====
+        // ===== 7. БОКОВАЯ ШТОРКА НАСТРОЕК =====
         drawerScrim = View(this).apply {
             layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
             setBackgroundColor(Color.parseColor("#99000000"))
@@ -1227,7 +1230,6 @@ class MainActivity : ComponentActivity() {
         }
         col.addView(btnSaveApi)
 
-        // Разделитель и подпись бренда AOR Systems + Версия 3.0
         val divider = View(this).apply {
             setBackgroundColor(p.border)
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)).apply {
@@ -1366,7 +1368,6 @@ class MainActivity : ComponentActivity() {
         rootFrame.setBackgroundColor(p.bg)
         headerContainer.setBackgroundColor(p.surface)
 
-        // Шапка
         val dateStr = formatShortDayMonth(thresholdMillis())
         tvThresholdBadge.text = if (tsd) "ТСД • До $dateStr" else "До $dateStr"
         tvThresholdBadge.textSize = spSize(13f)
@@ -1395,7 +1396,6 @@ class MainActivity : ComponentActivity() {
         styleChip(btnLock, false, p)
         styleChip(btnReset, false, p)
 
-        // Пресеты дат
         for ((days, tv) in presetViews) {
             val active = storage.offsetDays == days
             tv.textSize = spSize(12f)
@@ -1404,7 +1404,6 @@ class MainActivity : ComponentActivity() {
             tv.setTextColor(if (active) Color.WHITE else p.textPrimary)
         }
 
-        // Переключение режимов Камера / ТСД / Список
         if (tsd) {
             cameraSection.visibility = View.GONE
             listSection.visibility = View.VISIBLE
@@ -1426,7 +1425,6 @@ class MainActivity : ComponentActivity() {
             attachBannerCardTo(bannerSlotCamera)
         }
 
-        // Счётчики
         val expiredCount = items.count { isItemExpired(it) }
         val noDateCount = items.count { it.expDate == null && !it.isLoading }
 
@@ -1445,7 +1443,6 @@ class MainActivity : ComponentActivity() {
         tvStatNoDate.setTextColor(Color.parseColor("#F59E0B"))
         tvStatNoDate.background = roundedBg(p.surface, 10, p.border, 1)
 
-        // Вкладки списка
         for ((tab, tv) in tabViews) {
             styleChip(tv, selectedTab == tab, p)
         }
@@ -1571,12 +1568,7 @@ class MainActivity : ComponentActivity() {
     // ==================== АДАПТЕР СПИСКА (ОБЫЧНЫЙ + АККОРДЕОН ГРУППЫ) ====================
 
     private inner class ScanListAdapter : BaseAdapter() {
-        private sealed class RowEntry {
-            data class Single(val item: ScannedItem) : RowEntry()
-            data class Group(val title: String, val units: List<ScannedItem>) : RowEntry()
-        }
-
-        private var rows: List<RowEntry> = emptyList()
+        private var rows: List<ListRowEntry> = emptyList()
 
         fun rebuildData() {
             val q = searchQuery.trim().lowercase(Locale.getDefault())
@@ -1597,9 +1589,9 @@ class MainActivity : ComponentActivity() {
             rows = if (storage.groupByName) {
                 filtered
                     .groupBy { it.name?.trim()?.takeIf { n -> n.isNotEmpty() } ?: "GTIN: ${it.gtin}" }
-                    .map { (title, list) -> RowEntry.Group(title, list) }
+                    .map { (title, list) -> ListRowEntry.Group(title, list) }
             } else {
-                filtered.map { RowEntry.Single(it) }
+                filtered.map { ListRowEntry.Single(it) }
             }
         }
 
@@ -1610,8 +1602,8 @@ class MainActivity : ComponentActivity() {
         override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
             val p = palette()
             return when (val entry = rows[position]) {
-                is RowEntry.Single -> buildSingleCard(entry.item, p, compact = false)
-                is RowEntry.Group -> buildGroupCard(entry.title, entry.units, p)
+                is ListRowEntry.Single -> buildSingleCard(entry.item, p, compact = false)
+                is ListRowEntry.Group -> buildGroupCard(entry.title, entry.units, p)
             }
         }
 
@@ -1772,7 +1764,6 @@ class MainActivity : ComponentActivity() {
         mainHandler.post {
             val existing = items.find { it.uniqueKey == parsed.uniqueKey }
             if (existing != null) {
-                // Повторное наведение: показываем срок годности уже отсканированного товара!
                 activeBannerKey = existing.uniqueKey
                 isDuplicateBanner = true
                 triggerFeedback(expired = isItemExpired(existing), isDuplicate = true)
@@ -1907,7 +1898,6 @@ class MainActivity : ComponentActivity() {
         }
         flashOverlay.background = gd
         flashOverlay.visibility = View.VISIBLE
-        mainHandler.removeCallbacksAndMessages("flash_hide")
         mainHandler.postDelayed({ flashOverlay.visibility = View.GONE }, durationMs)
     }
 
@@ -1991,7 +1981,7 @@ class MainActivity : ComponentActivity() {
         val cam = boundCamera ?: return
         val zoomState = cam.cameraInfo.zoomState.value ?: return
         val target = when (zoomPresetIndex) {
-            0 -> zoomState.minZoomRatio.coerceAtLeast(0.5f) // Ширик / Макро 0.6x
+            0 -> zoomState.minZoomRatio.coerceAtLeast(0.5f)
             1 -> 1.0f.coerceIn(zoomState.minZoomRatio, zoomState.maxZoomRatio)
             2 -> 2.0f.coerceIn(zoomState.minZoomRatio, zoomState.maxZoomRatio)
             else -> 3.0f.coerceIn(zoomState.minZoomRatio, zoomState.maxZoomRatio)
@@ -2076,14 +2066,6 @@ class MainActivity : ComponentActivity() {
     }
 
     // ==================== СЕТЕВОЙ ЗАПРОС К ШЛЮЗУ ====================
-
-    private data class GatewayResult(
-        val expDate: String?,
-        val name: String?,
-        val status: String?,
-        val error: String?,
-        val shouldRetry: Boolean
-    )
 
     private suspend fun fetchFromGateway(
         endpoint: String,
