@@ -2,24 +2,49 @@ package com.revizor.scanner
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.AlertDialog
 import android.content.BroadcastReceiver
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.graphics.Color
+import android.graphics.Rect
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.media.AudioManager
 import android.media.ToneGenerator
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
+import android.text.Editable
+import android.text.InputType
+import android.text.TextUtils
+import android.text.TextWatcher
 import android.util.Size
+import android.util.TypedValue
+import android.view.GestureDetector
+import android.view.Gravity
 import android.view.KeyEvent
+import android.view.MotionEvent
+import android.view.View
+import android.view.ViewGroup
+import android.widget.BaseAdapter
+import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.ListView
+import android.widget.ScrollView
+import android.widget.Switch
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
@@ -28,54 +53,19 @@ import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.tween
-import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Clear
-import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.KeyboardArrowDown
-import androidx.compose.material.icons.filled.KeyboardArrowUp
-import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.Menu
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.Density
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.LifecycleOwner
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.OutputStreamWriter
@@ -87,6 +77,7 @@ import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
+import kotlin.math.abs
 import kotlin.random.Random
 
 // ==================== МОДЕЛИ ДАННЫХ ====================
@@ -120,9 +111,15 @@ enum class FilterTab(val title: String) {
     NO_DATE("Без даты")
 }
 
-enum class FlashType {
-    NONE, VALID, EXPIRED
-}
+data class ThemePalette(
+    val bg: Int,
+    val surface: Int,
+    val surfaceAlt: Int,
+    val textPrimary: Int,
+    val textSecondary: Int,
+    val border: Int,
+    val primary: Int
+)
 
 // ==================== ПАРСЕР ЧЕСТНОГО ЗНАКА ====================
 
@@ -243,8 +240,8 @@ class AppStorage(context: Context) {
         prefs.edit().putString("saved_items_json", arr.toString()).apply()
     }
 
-    fun loadItems(): List<ScannedItem> {
-        val raw = prefs.getString("saved_items_json", null) ?: return emptyList()
+    fun loadItems(): MutableList<ScannedItem> {
+        val raw = prefs.getString("saved_items_json", null) ?: return mutableListOf()
         return try {
             val arr = JSONArray(raw)
             val list = ArrayList<ScannedItem>(arr.length())
@@ -268,7 +265,7 @@ class AppStorage(context: Context) {
             }
             list
         } catch (_: Exception) {
-            emptyList()
+            mutableListOf()
         }
     }
 }
@@ -277,16 +274,172 @@ class AppStorage(context: Context) {
 
 class MainActivity : ComponentActivity() {
 
-    private val hardwareScanFlow = Channel<String>(Channel.UNLIMITED)
+    private lateinit var storage: AppStorage
+    private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private val apiQueue = Channel<ParsedDataMatrix>(Channel.UNLIMITED)
+    private val cameraExecutor = Executors.newSingleThreadExecutor()
+
+    private val items = mutableListOf<ScannedItem>()
+    private var activeBannerKey: String? = null
+    private var isDuplicateBanner = false
+
+    // Состояния UI
+    private var showListScreen = false
+    private var isDrawerOpen = false
+    private var isShelfLocked = false
+    private var torchEnabled = false
+    private var fullFrameScan = false
+    private var zoomPresetIndex = 1 // 0=0.6x, 1=1x, 2=2x, 3=3x
+    private var selectedTab = FilterTab.ALL
+    private var searchQuery = ""
+    private val expandedGroups = mutableSetOf<String>()
+
+    private var lastScanKey = ""
+    private var lastScanTime = 0L
+
+    // Перехват HID сканера
     private val keyBuffer = StringBuilder()
     private var lastKeyTime = 0L
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        setContent {
-            AorScannerApp(hardwareScanFlow = hardwareScanFlow)
+    // Камера и звук
+    private var cameraProvider: ProcessCameraProvider? = null
+    private var boundCamera: Camera? = null
+    private var toneGen: ToneGenerator? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    // Основные View
+    private lateinit var rootFrame: FrameLayout
+    private lateinit var headerContainer: LinearLayout
+    private lateinit var tvThresholdBadge: TextView
+    private lateinit var btnZoom: TextView
+    private lateinit var btnScanArea: TextView
+    private lateinit var btnTorch: TextView
+    private lateinit var btnLock: TextView
+    private lateinit var btnReset: TextView
+    private val presetViews = mutableMapOf<Int, TextView>()
+
+    // Экран камеры
+    private lateinit var cameraSection: FrameLayout
+    private lateinit var previewView: PreviewView
+    private lateinit var reticleView: View
+    private lateinit var tvPermissionHint: TextView
+    private lateinit var bottomHud: LinearLayout
+    private lateinit var tvStatAll: TextView
+    private lateinit var tvStatExpired: TextView
+    private lateinit var tvStatNoDate: TextView
+
+    // Карточка активного скана (используется и в камере, и в ТСД)
+    private lateinit var bannerSlotCamera: FrameLayout
+    private lateinit var bannerSlotTsd: FrameLayout
+    private lateinit var activeBannerCard: LinearLayout
+    private lateinit var tvBannerStatus: TextView
+    private lateinit var tvBannerDuplicateBadge: TextView
+    private lateinit var tvBannerName: TextView
+    private lateinit var tvBannerDate: TextView
+    private lateinit var fifoContainerBanner: LinearLayout
+    private lateinit var fifoFillBanner: View
+    private lateinit var tvFifoLabelBanner: TextView
+
+    // Экран списка / ТСД
+    private lateinit var listSection: LinearLayout
+    private lateinit var phoneListTopBar: LinearLayout
+    private lateinit var tvPhoneListTitle: TextView
+    private val tabViews = mutableMapOf<FilterTab, TextView>()
+    private lateinit var btnGroupToggle: TextView
+    private lateinit var etSearch: EditText
+    private lateinit var listView: ListView
+    private lateinit var listAdapter: ScanListAdapter
+    private lateinit var btnExportExpired: TextView
+    private lateinit var btnCopySummary: TextView
+    private lateinit var btnExportAll: TextView
+
+    // Вспышка и замок
+    private lateinit var flashOverlay: View
+    private lateinit var lockOverlay: FrameLayout
+
+    // Боковая шторка
+    private lateinit var drawerScrim: View
+    private lateinit var drawerPanel: ScrollView
+
+    // CSV экспорт
+    private var pendingCsvContent = ""
+    private val csvExportLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("text/csv")
+    ) { uri ->
+        if (uri != null) {
+            try {
+                contentResolver.openOutputStream(uri)?.use { out ->
+                    OutputStreamWriter(out, StandardCharsets.UTF_8).use { writer ->
+                        writer.write("\uFEFF")
+                        writer.write(pendingCsvContent)
+                    }
+                }
+                Toast.makeText(this, "CSV успешно сохранён", Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+                Toast.makeText(this, "Ошибка сохранения: ${e.message}", Toast.LENGTH_LONG).show()
+            }
         }
     }
+
+    private val cameraPermLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            tvPermissionHint.visibility = View.GONE
+            startCameraIfNeeded()
+        } else {
+            tvPermissionHint.visibility = View.VISIBLE
+        }
+    }
+
+    private val scanReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent == null) return
+            val code = intent.getStringExtra("scannerdata") // MERTECH Seuic AutoID Q9C (ScanTool)
+                ?: intent.getStringExtra("barcode_string")
+                ?: intent.getStringExtra("data")
+                ?: intent.getStringExtra("SCAN_BARCODE1")
+                ?: intent.getStringExtra("value")
+            if (!code.isNullOrBlank()) {
+                onRawBarcodeDetected(code)
+            }
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        storage = AppStorage(this)
+        items.clear()
+        items.addAll(storage.loadItems())
+
+        toneGen = try {
+            ToneGenerator(AudioManager.STREAM_ALARM, 90)
+        } catch (_: Exception) {
+            null
+        }
+
+        buildUi()
+        registerScannerBroadcast()
+        startApiWorker()
+        refreshAllUi()
+
+        if (!storage.tsdMode) {
+            ensureCameraStarted()
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        try {
+            unregisterReceiver(scanReceiver)
+        } catch (_: Exception) {
+        }
+        toneGen?.release()
+        cameraExecutor.shutdown()
+        uiScope.cancel()
+    }
+
+    // ==================== ПЕРЕХВАТ АППАРАТНОГО СКАНЕРА (HID) ====================
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (event.action == KeyEvent.ACTION_DOWN) {
@@ -300,7 +453,7 @@ class MainActivity : ComponentActivity() {
                 if (keyBuffer.length >= 18) {
                     val code = keyBuffer.toString()
                     keyBuffer.clear()
-                    hardwareScanFlow.trySend(code)
+                    onRawBarcodeDetected(code)
                     return true
                 }
                 keyBuffer.clear()
@@ -313,178 +466,1398 @@ class MainActivity : ComponentActivity() {
         }
         return super.dispatchKeyEvent(event)
     }
-}
 
-// ==================== ЦВЕТОВЫЕ СХЕМЫ ====================
-
-private val DarkScheme = darkColorScheme(
-    primary = Color(0xFF3B82F6),
-    onPrimary = Color.White,
-    background = Color(0xFF090B0E),
-    surface = Color(0xFF131720),
-    surfaceVariant = Color(0xFF1C2230),
-    onBackground = Color(0xFFF1F5F9),
-    onSurface = Color(0xFFF1F5F9),
-    onSurfaceVariant = Color(0xFF94A3B8),
-    outline = Color(0xFF2B3446)
-)
-
-private val LightScheme = lightColorScheme(
-    primary = Color(0xFF2563EB),
-    onPrimary = Color.White,
-    background = Color(0xFFF1F5F9),
-    surface = Color(0xFFFFFFFF),
-    surfaceVariant = Color(0xFFE2E8F0),
-    onBackground = Color(0xFF0F172A),
-    onSurface = Color(0xFF0F172A),
-    onSurfaceVariant = Color(0xFF475569),
-    outline = Color(0xFFCBD5E1)
-)
-
-// ==================== УТИЛИТЫ ДАТ ====================
-
-private fun todayZeroMillis(): Long {
-    val c = Calendar.getInstance()
-    c.set(Calendar.HOUR_OF_DAY, 0)
-    c.set(Calendar.MINUTE, 0)
-    c.set(Calendar.SECOND, 0)
-    c.set(Calendar.MILLISECOND, 0)
-    return c.timeInMillis
-}
-
-private fun addDaysToTodayMillis(days: Int): Long {
-    val c = Calendar.getInstance()
-    c.timeInMillis = todayZeroMillis()
-    c.add(Calendar.DAY_OF_YEAR, days)
-    return c.timeInMillis
-}
-
-private fun parseIsoToMillis(iso: String?): Long? {
-    if (iso.isNullOrBlank() || iso.length < 10) return null
-    return try {
-        val parts = iso.take(10).split("-")
-        if (parts.size != 3) return null
-        val c = Calendar.getInstance()
-        c.set(Calendar.YEAR, parts[0].toInt())
-        c.set(Calendar.MONTH, parts[1].toInt() - 1)
-        c.set(Calendar.DAY_OF_MONTH, parts[2].toInt())
-        c.set(Calendar.HOUR_OF_DAY, 0)
-        c.set(Calendar.MINUTE, 0)
-        c.set(Calendar.SECOND, 0)
-        c.set(Calendar.MILLISECOND, 0)
-        c.timeInMillis
-    } catch (_: Exception) {
-        null
-    }
-}
-
-private fun formatShortDayMonth(millis: Long): String {
-    val sdf = SimpleDateFormat("dd.MM", Locale.getDefault())
-    return sdf.format(Date(millis))
-}
-
-private fun formatIsoFileDate(): String {
-    val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
-    return sdf.format(Date())
-}
-
-private fun formatRuDate(iso: String?): String {
-    if (iso.isNullOrBlank() || iso.length < 10) return "—"
-    val parts = iso.take(10).split("-")
-    return if (parts.size == 3) "${parts[2]}.${parts[1]}.${parts[0]}" else iso
-}
-
-private fun parseRuToIso(ru: String): String? {
-    val parts = ru.trim().split(".")
-    if (parts.size != 3) return null
-    val d = parts[0].padStart(2, '0')
-    val m = parts[1].padStart(2, '0')
-    val y = parts[2]
-    if (y.length != 4) return null
-    return "$y-$m-$d"
-}
-
-// ==================== ОСНОВНОЙ UI ПРИЛОЖЕНИЯ ====================
-
-@Composable
-fun AorScannerApp(hardwareScanFlow: Channel<String>) {
-    val context = LocalContext.current
-    val clipboard = LocalClipboardManager.current
-    val storage = remember { AppStorage(context) }
-
-    var items by remember { mutableStateOf(storage.loadItems()) }
-    var soundEnabled by remember { mutableStateOf(storage.soundEnabled) }
-    var tsdMode by remember { mutableStateOf(storage.tsdMode) }
-    var darkTheme by remember { mutableStateOf(storage.darkTheme) }
-    var largeFont by remember { mutableStateOf(storage.largeFont) }
-    var flashEnabled by remember { mutableStateOf(storage.flashEnabled) }
-    var fifoBarEnabled by remember { mutableStateOf(storage.fifoBarEnabled) }
-    var groupByName by remember { mutableStateOf(storage.groupByName) }
-    var offsetDays by remember { mutableIntStateOf(storage.offsetDays) }
-
-    var apiUrl by remember { mutableStateOf(storage.apiUrl) }
-    var apiMode by remember { mutableStateOf(storage.apiMode) }
-    var apiToken by remember { mutableStateOf(storage.apiToken) }
-
-    var showListScreen by remember { mutableStateOf(false) }
-    var activeBannerKey by remember { mutableStateOf<String?>(null) }
-    var isDuplicateBanner by remember { mutableStateOf(false) }
-    var flashType by remember { mutableStateOf(FlashType.NONE) }
-    var isShelfLocked by remember { mutableStateOf(false) }
-    var showResetConfirm by remember { mutableStateOf(false) }
-    var showManualAddDialog by remember { mutableStateOf(false) }
-
-    var hasCameraPermission by remember {
-        mutableStateOf(
-            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
-        )
-    }
-    val permissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted -> hasCameraPermission = granted }
-
-    var torchEnabled by remember { mutableStateOf(false) }
-    var fullFrameScan by remember { mutableStateOf(false) }
-    var zoomPresetIndex by remember { mutableIntStateOf(1) }
-
-    var selectedTab by remember { mutableStateOf(FilterTab.ALL) }
-    var searchQuery by remember { mutableStateOf("") }
-    var expandedGroups by remember { mutableStateOf(setOf<String>()) }
-
-    val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
-    val scope = rememberCoroutineScope()
-    val apiQueue = remember { Channel<ParsedDataMatrix>(Channel.UNLIMITED) }
-
-    val todayMillis = remember { todayZeroMillis() }
-    val thresholdMillis = remember(offsetDays) { addDaysToTodayMillis(offsetDays) }
-
-    fun isExpired(expIso: String?): Boolean {
-        val expMs = parseIsoToMillis(expIso) ?: return false
-        return expMs <= thresholdMillis
-    }
-
-    fun updateItems(newList: List<ScannedItem>) {
-        items = newList
-        storage.saveItems(newList)
-    }
-
-    val toneGen = remember {
-        try {
-            ToneGenerator(AudioManager.STREAM_ALARM, 90)
-        } catch (_: Exception) {
-            null
+    private fun registerScannerBroadcast() {
+        val filter = IntentFilter().apply {
+            addAction("com.android.server.scannerservice.broadcast") // Seuic ScanTool
+            addAction("android.intent.ACTION_DECODE_DATA")
+            addAction("nlscan.action.SCANNER_RESULT")
+            addAction("com.scanner.broadcast")
         }
-    }
-    DisposableEffect(Unit) {
-        onDispose { toneGen?.release() }
-    }
-
-    fun triggerFeedback(expired: Boolean, isDuplicate: Boolean = false) {
-        val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            (context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager)?.defaultVibrator
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(scanReceiver, filter, 2)
         } else {
             @Suppress("DEPRECATION")
-            context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+            registerReceiver(scanReceiver, filter)
+        }
+    }
+
+    // ==================== ПОСТРОЕНИЕ ИНТЕРФЕЙСА ====================
+
+    private fun palette(): ThemePalette {
+        return if (storage.darkTheme) {
+            ThemePalette(
+                bg = Color.parseColor("#090B0E"),
+                surface = Color.parseColor("#131720"),
+                surfaceAlt = Color.parseColor("#1C2230"),
+                textPrimary = Color.parseColor("#F1F5F9"),
+                textSecondary = Color.parseColor("#94A3B8"),
+                border = Color.parseColor("#2B3446"),
+                primary = Color.parseColor("#3B82F6")
+            )
+        } else {
+            ThemePalette(
+                bg = Color.parseColor("#F1F5F9"),
+                surface = Color.parseColor("#FFFFFF"),
+                surfaceAlt = Color.parseColor("#E2E8F0"),
+                textPrimary = Color.parseColor("#0F172A"),
+                textSecondary = Color.parseColor("#475569"),
+                border = Color.parseColor("#CBD5E1"),
+                primary = Color.parseColor("#2563EB")
+            )
+        }
+    }
+
+    private fun spSize(base: Float): Float = if (storage.largeFont) base * 1.2f else base
+
+    private fun dp(value: Int): Int =
+        TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, value.toFloat(), resources.displayMetrics).toInt()
+
+    private fun roundedBg(fillColor: Int, radiusDp: Int = 10, strokeColor: Int = Color.TRANSPARENT, strokeDp: Int = 0): GradientDrawable {
+        return GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = dp(radiusDp).toFloat()
+            setColor(fillColor)
+            if (strokeDp > 0) {
+                setStroke(dp(strokeDp), strokeColor)
+            }
+        }
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun buildUi() {
+        rootFrame = FrameLayout(this).apply {
+            layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        }
+
+        // Жест свайпа слева направо для открытия шторки настроек
+        val swipeDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onFling(e1: MotionEvent?, e2: MotionEvent, velocityX: Float, velocityY: Float): Boolean {
+                if (isShelfLocked || e1 == null) return false
+                val dx = e2.x - e1.x
+                val dy = e2.y - e1.y
+                if (abs(dx) > abs(dy) && abs(dx) > dp(60)) {
+                    if (dx > 0 && !isDrawerOpen && e1.x < dp(65)) {
+                        openDrawer()
+                        return true
+                    } else if (dx < 0 && isDrawerOpen) {
+                        closeDrawer()
+                        return true
+                    }
+                }
+                return false
+            }
+        })
+
+        val mainColumn = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        }
+
+        // ===== 1. ВЕРХНЯЯ ПАНЕЛЬ УПРАВЛЕНИЯ =====
+        headerContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+        }
+
+        val topRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
+        val btnMenu = TextView(this).apply {
+            text = "☰"
+            textSize = 20f
+            setTypeface(null, Typeface.BOLD)
+            gravity = Gravity.CENTER
+            setPadding(dp(10), dp(4), dp(10), dp(4))
+            setOnClickListener { openDrawer() }
+        }
+        topRow.addView(btnMenu)
+
+        tvThresholdBadge = TextView(this).apply {
+            setTypeface(null, Typeface.BOLD)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            setPadding(dp(10), dp(7), dp(10), dp(7))
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginStart = dp(4)
+                marginEnd = dp(6)
+            }
+        }
+        topRow.addView(tvThresholdBadge)
+
+        btnZoom = makeHeaderChip("1x") {
+            zoomPresetIndex = (zoomPresetIndex + 1) % 4
+            applyCameraZoom()
+            refreshAllUi()
+        }
+        topRow.addView(btnZoom, marginRightParams(5))
+
+        btnScanArea = makeHeaderChip("Центр") {
+            fullFrameScan = !fullFrameScan
+            refreshAllUi()
+        }
+        topRow.addView(btnScanArea, marginRightParams(5))
+
+        btnTorch = makeHeaderChip("🔦") {
+            torchEnabled = !torchEnabled
+            boundCamera?.cameraControl?.enableTorch(torchEnabled)
+            refreshAllUi()
+        }
+        topRow.addView(btnTorch, marginRightParams(5))
+
+        btnLock = makeHeaderChip("🔒") {
+            isShelfLocked = true
+            lockOverlay.visibility = View.VISIBLE
+        }
+        topRow.addView(btnLock, marginRightParams(5))
+
+        btnReset = makeHeaderChip("Сброс") {
+            if (items.isNotEmpty()) confirmResetDialog()
+        }
+        topRow.addView(btnReset)
+
+        headerContainer.addView(topRow)
+
+        // Ряд пресетов дат
+        val presetsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(6)
+            }
+        }
+        val presets = listOf(0 to "Сегодня", 1 to "+1 дн", 3 to "+3 дн", 7 to "+7 дн", 14 to "+14 дн")
+        presets.forEachIndexed { idx, (days, label) ->
+            val tv = TextView(this).apply {
+                text = label
+                gravity = Gravity.CENTER
+                setPadding(dp(4), dp(6), dp(4), dp(6))
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    if (idx < presets.lastIndex) marginEnd = dp(5)
+                }
+                setOnClickListener {
+                    storage.offsetDays = days
+                    refreshAllUi()
+                }
+            }
+            presetViews[days] = tv
+            presetsRow.addView(tv)
+        }
+        headerContainer.addView(presetsRow)
+        mainColumn.addView(headerContainer)
+
+        // ===== 2. КАРТОЧКА ТЕКУЩЕГО / ПОСЛЕДНЕГО СКАНА =====
+        activeBannerCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setOnClickListener {
+                if (!storage.tsdMode) {
+                    showListScreen = true
+                    refreshAllUi()
+                }
+            }
+        }
+
+        val bannerTopRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        tvBannerStatus = TextView(this).apply {
+            setTypeface(null, Typeface.BOLD)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        tvBannerDuplicateBadge = TextView(this).apply {
+            text = "Уже в списке"
+            setPadding(dp(7), dp(2), dp(7), dp(2))
+            visibility = View.GONE
+        }
+        bannerTopRow.addView(tvBannerStatus)
+        bannerTopRow.addView(tvBannerDuplicateBadge)
+        activeBannerCard.addView(bannerTopRow)
+
+        tvBannerName = TextView(this).apply {
+            setTypeface(null, Typeface.BOLD)
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(4)
+            }
+        }
+        activeBannerCard.addView(tvBannerName)
+
+        tvBannerDate = TextView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(3)
+            }
+        }
+        activeBannerCard.addView(tvBannerDate)
+
+        // Шкала свежести FIFO в карточке скана
+        fifoContainerBanner = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(6)
+            }
+        }
+        val fifoTrack = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(0, dp(5), 1f)
+        }
+        fifoFillBanner = View(this).apply {
+            layoutParams = FrameLayout.LayoutParams(dp(80), ViewGroup.LayoutParams.MATCH_PARENT)
+        }
+        fifoTrack.addView(fifoFillBanner)
+
+        tvFifoLabelBanner = TextView(this).apply {
+            setTypeface(null, Typeface.BOLD)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                marginStart = dp(8)
+            }
+        }
+        fifoContainerBanner.addView(fifoTrack)
+        fifoContainerBanner.addView(tvFifoLabelBanner)
+        activeBannerCard.addView(fifoContainerBanner)
+
+        // ===== 3. ОБЛАСТЬ КАМЕРЫ (РЕЖИМ ТЕЛЕФОНА) =====
+        cameraSection = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+        }
+
+        previewView = PreviewView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        }
+        cameraSection.addView(previewView)
+
+        reticleView = View(this).apply {
+            layoutParams = FrameLayout.LayoutParams(dp(210), dp(210), Gravity.CENTER).apply {
+                bottomMargin = dp(45)
+            }
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp(16).toFloat()
+                setColor(Color.TRANSPARENT)
+                setStroke(dp(2), Color.parseColor("#BF38BDF8"))
+            }
+        }
+        cameraSection.addView(reticleView)
+
+        tvPermissionHint = TextView(this).apply {
+            text = "Нажмите, чтобы разрешить доступ к камере"
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            background = roundedBg(Color.parseColor("#CC1E293B"), 12)
+            visibility = View.GONE
+            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER)
+            setOnClickListener { cameraPermLauncher.launch(Manifest.permission.CAMERA) }
+        }
+        cameraSection.addView(tvPermissionHint)
+
+        // Нижняя панель счётчиков + активный скан
+        bottomHud = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(10), dp(10), dp(10), dp(12))
+            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM)
+        }
+
+        val statsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(8)
+            }
+        }
+
+        tvStatAll = makeStatChip {
+            selectedTab = FilterTab.ALL
+            showListScreen = true
+            refreshAllUi()
+        }
+        tvStatExpired = makeStatChip {
+            selectedTab = FilterTab.EXPIRED
+            showListScreen = true
+            refreshAllUi()
+        }
+        tvStatNoDate = makeStatChip {
+            selectedTab = FilterTab.NO_DATE
+            showListScreen = true
+            refreshAllUi()
+        }
+        statsRow.addView(tvStatAll, statWeightParams(6))
+        statsRow.addView(tvStatExpired, statWeightParams(6))
+        statsRow.addView(tvStatNoDate, statWeightParams(0))
+        bottomHud.addView(statsRow)
+
+        bannerSlotCamera = FrameLayout(this)
+        bottomHud.addView(bannerSlotCamera)
+        cameraSection.addView(bottomHud)
+        mainColumn.addView(cameraSection)
+
+        // ===== 4. ОБЛАСТЬ СПИСКА (И ДЛЯ ТСД, И ДЛЯ ПРОСМОТРА НА ТЕЛЕФОНЕ) =====
+        listSection = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(10), dp(6), dp(10), dp(10))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+            visibility = View.GONE
+        }
+
+        // Верхняя полоска возврата к камере (показывается только в режиме смартфона)
+        phoneListTopBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(4), 0, dp(8))
+        }
+        val btnBackCamera = makeHeaderChip("← К камере") {
+            showListScreen = false
+            refreshAllUi()
+        }
+        tvPhoneListTitle = TextView(this).apply {
+            setTypeface(null, Typeface.BOLD)
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val btnClearList = makeHeaderChip("Очистить") {
+            if (items.isNotEmpty()) confirmResetDialog()
+        }
+        phoneListTopBar.addView(btnBackCamera)
+        phoneListTopBar.addView(tvPhoneListTitle)
+        phoneListTopBar.addView(btnClearList)
+        listSection.addView(phoneListTopBar)
+
+        // Слот для плашки последнего скана в режиме ТСД
+        bannerSlotTsd = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(8)
+            }
+        }
+        listSection.addView(bannerSlotTsd)
+
+        // Вкладки фильтрации + кнопка Группы
+        val tabsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(6)
+            }
+        }
+        FilterTab.values().forEach { tab ->
+            val tv = TextView(this).apply {
+                text = tab.title
+                setPadding(dp(9), dp(6), dp(9), dp(6))
+                setOnClickListener {
+                    selectedTab = tab
+                    refreshAllUi()
+                }
+            }
+            tabViews[tab] = tv
+            tabsRow.addView(tv, marginRightParams(5))
+        }
+
+        val spacer = View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(0, 1, 1f)
+        }
+        tabsRow.addView(spacer)
+
+        btnGroupToggle = TextView(this).apply {
+            text = "Группы"
+            setPadding(dp(9), dp(6), dp(9), dp(6))
+            setOnClickListener {
+                storage.groupByName = !storage.groupByName
+                refreshAllUi()
+            }
+        }
+        tabsRow.addView(btnGroupToggle)
+        listSection.addView(tabsRow)
+
+        // Поле поиска
+        etSearch = EditText(this).apply {
+            hint = "Поиск по названию, GTIN или SN..."
+            isSingleLine = true
+            setPadding(dp(12), dp(9), dp(12), dp(9))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(6)
+            }
+            addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                    searchQuery = s?.toString() ?: ""
+                    refreshListOnly()
+                }
+                override fun afterTextChanged(s: Editable?) {}
+            })
+        }
+        listSection.addView(etSearch)
+
+        // Сам список позиций / аккордеон-групп
+        listAdapter = ScanListAdapter()
+        listView = ListView(this).apply {
+            divider = null
+            dividerHeight = dp(6)
+            adapter = listAdapter
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+        }
+        listSection.addView(listView)
+
+        // Нижние кнопки экспорта
+        val exportRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(6)
+            }
+        }
+        btnExportExpired = TextView(this).apply {
+            text = "📥 CSV Просрочка"
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            setTypeface(null, Typeface.BOLD)
+            setPadding(dp(8), dp(10), dp(8), dp(10))
+            background = roundedBg(Color.parseColor("#DC2626"), 10)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.25f).apply {
+                marginEnd = dp(6)
+            }
+            setOnClickListener {
+                pendingCsvContent = buildCsv(items.filter { isItemExpired(it) })
+                csvExportLauncher.launch("AOR_Prosrochka_${formatIsoFileDate()}.csv")
+            }
+        }
+        btnCopySummary = TextView(this).apply {
+            text = "📋 Сводка"
+            gravity = Gravity.CENTER
+            setTypeface(null, Typeface.BOLD)
+            setPadding(dp(8), dp(10), dp(8), dp(10))
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = dp(6)
+            }
+            setOnClickListener {
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("AOR Сводка", buildMessengerSummary()))
+                Toast.makeText(this@MainActivity, "Сводка скопирована для мессенджера", Toast.LENGTH_SHORT).show()
+            }
+        }
+        btnExportAll = TextView(this).apply {
+            text = "📥 Всё"
+            gravity = Gravity.CENTER
+            setTypeface(null, Typeface.BOLD)
+            setPadding(dp(8), dp(10), dp(8), dp(10))
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.9f)
+            setOnClickListener {
+                pendingCsvContent = buildCsv(items)
+                csvExportLauncher.launch("AOR_Reviziya_${formatIsoFileDate()}.csv")
+            }
+        }
+        exportRow.addView(btnExportExpired)
+        exportRow.addView(btnCopySummary)
+        exportRow.addView(btnExportAll)
+        listSection.addView(exportRow)
+        mainColumn.addView(listSection)
+
+        rootFrame.addView(mainColumn)
+
+        // ===== 5. ПОЛНОЭКРАННАЯ ЦВЕТОВАЯ ВСПЫШКА =====
+        flashOverlay = View(this).apply {
+            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            visibility = View.GONE
+            isClickable = false
+        }
+        rootFrame.addView(flashOverlay)
+
+        // ===== 6. ЗАМОК ОТ СЛУЧАЙНЫХ КАСАНИЙ НА ПОЛКЕ =====
+        lockOverlay = FrameLayout(this).apply {
+            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            setBackgroundColor(Color.parseColor("#B3000000"))
+            visibility = View.GONE
+            isClickable = true
+            isLongClickable = true
+            setOnLongClickListener {
+                isShelfLocked = false
+                visibility = View.GONE
+                Toast.makeText(this@MainActivity, "Экран разблокирован", Toast.LENGTH_SHORT).show()
+                true
+            }
+        }
+        val lockCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(22), dp(20), dp(22), dp(20))
+            background = roundedBg(Color.parseColor("#131720"), 16, Color.parseColor("#3B82F6"), 1)
+            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER).apply {
+                marginStart = dp(24)
+                marginEnd = dp(24)
+            }
+        }
+        lockCard.addView(TextView(this).apply {
+            text = "🔒"
+            textSize = 32f
+            gravity = Gravity.CENTER
+        })
+        lockCard.addView(TextView(this).apply {
+            text = "Экран заблокирован от полки"
+            setTextColor(Color.WHITE)
+            textSize = 16f
+            setTypeface(null, Typeface.BOLD)
+            gravity = Gravity.CENTER
+            setPadding(0, dp(8), 0, dp(6))
+        })
+        lockCard.addView(TextView(this).apply {
+            text = "Сканер и вибрация активны.\nУдерживайте палец на экране 1 сек для разблокировки."
+            setTextColor(Color.parseColor("#94A3B8"))
+            textSize = 13f
+            gravity = Gravity.CENTER
+        })
+        lockOverlay.addView(lockCard)
+        rootFrame.addView(lockOverlay)
+
+        // ===== 7. БОКОВАЯ ШТОРКА НАСТРОЕК (СВАЙП СЛЕВА НАПРАВО) =====
+        drawerScrim = View(this).apply {
+            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            setBackgroundColor(Color.parseColor("#99000000"))
+            visibility = View.GONE
+            setOnClickListener { closeDrawer() }
+        }
+        rootFrame.addView(drawerScrim)
+
+        drawerPanel = ScrollView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(dp(305), ViewGroup.LayoutParams.MATCH_PARENT, Gravity.START)
+            visibility = View.GONE
+            translationX = -dp(305).toFloat()
+        }
+        buildDrawerContent()
+        rootFrame.addView(drawerPanel)
+
+        rootFrame.setOnTouchListener { _, event ->
+            swipeDetector.onTouchEvent(event)
+            false
+        }
+
+        setContentView(rootFrame)
+    }
+
+    private fun buildDrawerContent() {
+        drawerPanel.removeAllViews()
+        val p = palette()
+        drawerPanel.setBackgroundColor(p.surface)
+
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(18), dp(16), dp(24))
+        }
+
+        col.addView(TextView(this).apply {
+            text = "Параметры терминала"
+            textSize = spSize(18f)
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(p.textPrimary)
+        })
+
+        col.addView(makeDrawerSectionHeader("Оборудование", p))
+        col.addView(makeDrawerSwitch(
+            title = "Режим ТСД (без камеры)",
+            subtitle = "Для MERTECH Seuic AutoID Q9C и 2D-сканеров",
+            checked = storage.tsdMode,
+            p = p
+        ) { enabled ->
+            storage.tsdMode = enabled
+            if (enabled) {
+                torchEnabled = false
+                showListScreen = false
+                cameraProvider?.unbindAll()
+            } else {
+                ensureCameraStarted()
+            }
+            refreshAllUi()
+        })
+
+        col.addView(makeDrawerSectionHeader("Дизайн и индикация", p))
+        col.addView(makeDrawerSwitch(
+            title = "Тёмная тема (AMOLED)",
+            subtitle = "Выключите для светлой темы в ярком зале",
+            checked = storage.darkTheme,
+            p = p
+        ) { enabled ->
+            storage.darkTheme = enabled
+            buildDrawerContent()
+            refreshAllUi()
+        })
+
+        col.addView(makeDrawerSwitch(
+            title = "Крупный шрифт",
+            subtitle = "Увеличенный интерфейс для 4\" экранов",
+            checked = storage.largeFont,
+            p = p
+        ) { enabled ->
+            storage.largeFont = enabled
+            buildDrawerContent()
+            refreshAllUi()
+        })
+
+        col.addView(makeDrawerSwitch(
+            title = "Цветовая вспышка экрана",
+            subtitle = "Подсветка краёв зелёным/красным при скане",
+            checked = storage.flashEnabled,
+            p = p
+        ) { enabled ->
+            storage.flashEnabled = enabled
+        })
+
+        col.addView(makeDrawerSwitch(
+            title = "Шкала свежести (FIFO)",
+            subtitle = "Индикатор ротации по остатку дней",
+            checked = storage.fifoBarEnabled,
+            p = p
+        ) { enabled ->
+            storage.fifoBarEnabled = enabled
+            refreshAllUi()
+        })
+
+        col.addView(makeDrawerSectionHeader("Звук и ручной ввод", p))
+        col.addView(makeDrawerSwitch(
+            title = "Звуковой сигнал",
+            subtitle = "Вибрация работает всегда даже без звука",
+            checked = storage.soundEnabled,
+            p = p
+        ) { enabled ->
+            storage.soundEnabled = enabled
+        })
+
+        val btnManual = TextView(this).apply {
+            text = "+ Добавить позицию вручную"
+            gravity = Gravity.CENTER
+            textSize = spSize(13f)
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(p.textPrimary)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = roundedBg(p.surfaceAlt, 10, p.border, 1)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(8)
+            }
+            setOnClickListener {
+                closeDrawer()
+                openManualAddDialog()
+            }
+        }
+        col.addView(btnManual)
+
+        col.addView(makeDrawerSectionHeader("Настройки API / Шлюз ЧЗ", p))
+        val etApiUrl = EditText(this).apply {
+            setText(storage.apiUrl)
+            hint = "URL шлюза API"
+            textSize = spSize(13f)
+            setTextColor(p.textPrimary)
+            setHintTextColor(p.textSecondary)
+            isSingleLine = true
+            setPadding(dp(10), dp(9), dp(10), dp(9))
+            background = roundedBg(p.surfaceAlt, 8, p.border, 1)
+        }
+        col.addView(etApiUrl)
+
+        val modeRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(8)
+            }
+        }
+        var draftMode = storage.apiMode
+        val btnMobileApi = TextView(this)
+        val btnTrueApi = TextView(this)
+        val etToken = EditText(this).apply {
+            setText(storage.apiToken)
+            hint = "Bearer токен True API"
+            textSize = spSize(13f)
+            setTextColor(p.textPrimary)
+            setHintTextColor(p.textSecondary)
+            isSingleLine = true
+            setPadding(dp(10), dp(9), dp(10), dp(9))
+            background = roundedBg(p.surfaceAlt, 8, p.border, 1)
+            visibility = if (draftMode == "true_api") View.VISIBLE else View.GONE
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(8)
+            }
+        }
+
+        fun updateModeChips() {
+            btnMobileApi.background = roundedBg(if (draftMode == "mobile_api") p.primary else p.surfaceAlt, 8)
+            btnMobileApi.setTextColor(if (draftMode == "mobile_api") Color.WHITE else p.textPrimary)
+            btnTrueApi.background = roundedBg(if (draftMode == "true_api") p.primary else p.surfaceAlt, 8)
+            btnTrueApi.setTextColor(if (draftMode == "true_api") Color.WHITE else p.textPrimary)
+            etToken.visibility = if (draftMode == "true_api") View.VISIBLE else View.GONE
+        }
+
+        btnMobileApi.apply {
+            text = "Mobile API"
+            gravity = Gravity.CENTER
+            textSize = spSize(12f)
+            setTypeface(null, Typeface.BOLD)
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) }
+            setOnClickListener { draftMode = "mobile_api"; updateModeChips() }
+        }
+        btnTrueApi.apply {
+            text = "True API"
+            gravity = Gravity.CENTER
+            textSize = spSize(12f)
+            setTypeface(null, Typeface.BOLD)
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            setOnClickListener { draftMode = "true_api"; updateModeChips() }
+        }
+        updateModeChips()
+        modeRow.addView(btnMobileApi)
+        modeRow.addView(btnTrueApi)
+        col.addView(modeRow)
+        col.addView(etToken)
+
+        val btnSaveApi = TextView(this).apply {
+            text = "Сохранить параметры API"
+            gravity = Gravity.CENTER
+            textSize = spSize(13f)
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.WHITE)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = roundedBg(p.primary, 10)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(8)
+            }
+            setOnClickListener {
+                storage.apiUrl = etApiUrl.text.toString()
+                storage.apiMode = draftMode
+                storage.apiToken = etToken.text.toString()
+                Toast.makeText(this@MainActivity, "Настройки шлюза сохранены", Toast.LENGTH_SHORT).show()
+            }
+        }
+        col.addView(btnSaveApi)
+
+        // Разделитель и подпись бренда AOR Systems + Версия 3.0
+        val divider = View(this).apply {
+            setBackgroundColor(p.border)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)).apply {
+                topMargin = dp(22)
+                bottomMargin = dp(12)
+            }
+        }
+        col.addView(divider)
+
+        col.addView(TextView(this).apply {
+            text = "AOR Systems"
+            textSize = spSize(15f)
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(p.textPrimary)
+            gravity = Gravity.CENTER
+        })
+        col.addView(TextView(this).apply {
+            text = "Версия 3.0"
+            textSize = spSize(12f)
+            setTextColor(p.textSecondary)
+            gravity = Gravity.CENTER
+            setPadding(0, dp(2), 0, 0)
+        })
+
+        drawerPanel.addView(col)
+    }
+
+    private fun openDrawer() {
+        isDrawerOpen = true
+        drawerScrim.visibility = View.VISIBLE
+        drawerPanel.visibility = View.VISIBLE
+        drawerPanel.animate().translationX(0f).setDuration(200).start()
+    }
+
+    private fun closeDrawer() {
+        isDrawerOpen = false
+        drawerScrim.visibility = View.GONE
+        drawerPanel.animate().translationX(-dp(305).toFloat()).setDuration(180).withEndAction {
+            if (!isDrawerOpen) drawerPanel.visibility = View.GONE
+        }.start()
+    }
+
+    private fun makeDrawerSectionHeader(title: String, p: ThemePalette): TextView {
+        return TextView(this).apply {
+            text = title.uppercase(Locale.getDefault())
+            textSize = spSize(11f)
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(p.primary)
+            setPadding(0, dp(14), 0, dp(4))
+        }
+    }
+
+    private fun makeDrawerSwitch(
+        title: String,
+        subtitle: String,
+        checked: Boolean,
+        p: ThemePalette,
+        onToggle: (Boolean) -> Unit
+    ): LinearLayout {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(6), 0, dp(6))
+        }
+        val textCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = dp(8)
+            }
+        }
+        textCol.addView(TextView(this).apply {
+            text = title
+            textSize = spSize(14f)
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(p.textPrimary)
+        })
+        textCol.addView(TextView(this).apply {
+            text = subtitle
+            textSize = spSize(11f)
+            setTextColor(p.textSecondary)
+        })
+        val sw = Switch(this).apply {
+            isChecked = checked
+            setOnCheckedChangeListener { _, isChecked -> onToggle(isChecked) }
+        }
+        row.setOnClickListener { sw.isChecked = !sw.isChecked }
+        row.addView(textCol)
+        row.addView(sw)
+        return row
+    }
+
+    private fun makeHeaderChip(label: String, onClick: () -> Unit): TextView {
+        return TextView(this).apply {
+            text = label
+            setTypeface(null, Typeface.BOLD)
+            gravity = Gravity.CENTER
+            setPadding(dp(9), dp(7), dp(9), dp(7))
+            setOnClickListener { onClick() }
+        }
+    }
+
+    private fun makeStatChip(onClick: () -> Unit): TextView {
+        return TextView(this).apply {
+            gravity = Gravity.CENTER
+            setPadding(dp(6), dp(6), dp(6), dp(6))
+            setOnClickListener { onClick() }
+        }
+    }
+
+    private fun marginRightParams(dpRight: Int): LinearLayout.LayoutParams {
+        return LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            marginEnd = dp(dpRight)
+        }
+    }
+
+    private fun statWeightParams(dpRight: Int): LinearLayout.LayoutParams {
+        return LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+            if (dpRight > 0) marginEnd = dp(dpRight)
+        }
+    }
+
+    // ==================== ОБНОВЛЕНИЕ СОСТОЯНИЯ ЭКРАНА ====================
+
+    private fun thresholdMillis(): Long = addDaysToTodayMillis(storage.offsetDays)
+
+    private fun isItemExpired(item: ScannedItem): Boolean {
+        if (item.status == "RETIRED") return true
+        val expMs = parseIsoToMillis(item.expDate) ?: return false
+        return expMs <= thresholdMillis()
+    }
+
+    private fun refreshAllUi() {
+        val p = palette()
+        val tsd = storage.tsdMode
+
+        rootFrame.setBackgroundColor(p.bg)
+        headerContainer.setBackgroundColor(p.surface)
+
+        // Шапка
+        val dateStr = formatShortDayMonth(thresholdMillis())
+        tvThresholdBadge.text = if (tsd) "ТСД • До $dateStr" else "До $dateStr"
+        tvThresholdBadge.textSize = spSize(13f)
+        tvThresholdBadge.setTextColor(p.textPrimary)
+        tvThresholdBadge.background = roundedBg(p.surfaceAlt, 8)
+
+        btnZoom.visibility = if (tsd) View.GONE else View.VISIBLE
+        btnScanArea.visibility = if (tsd) View.GONE else View.VISIBLE
+        btnTorch.visibility = if (tsd) View.GONE else View.VISIBLE
+
+        btnZoom.text = when (zoomPresetIndex) {
+            0 -> "0.6x"
+            1 -> "1x"
+            2 -> "2x"
+            else -> "3x"
+        }
+        styleChip(btnZoom, false, p)
+
+        btnScanArea.text = if (fullFrameScan) "Весь" else "Центр"
+        styleChip(btnScanArea, fullFrameScan, p)
+        reticleView.visibility = if (!tsd && !fullFrameScan) View.VISIBLE else View.GONE
+
+        btnTorch.background = roundedBg(if (torchEnabled) Color.parseColor("#F59E0B") else p.surfaceAlt, 8)
+        btnTorch.setTextColor(if (torchEnabled) Color.BLACK else p.textPrimary)
+
+        styleChip(btnLock, false, p)
+        styleChip(btnReset, false, p)
+
+        // Пресеты дат
+        for ((days, tv) in presetViews) {
+            val active = storage.offsetDays == days
+            tv.textSize = spSize(12f)
+            tv.setTypeface(null, if (active) Typeface.BOLD else Typeface.NORMAL)
+            tv.background = roundedBg(if (active) p.primary else p.surfaceAlt, 8)
+            tv.setTextColor(if (active) Color.WHITE else p.textPrimary)
+        }
+
+        // Переключение режимов Камера / ТСД / Список
+        if (tsd) {
+            cameraSection.visibility = View.GONE
+            listSection.visibility = View.VISIBLE
+            phoneListTopBar.visibility = View.GONE
+            bannerSlotTsd.visibility = View.VISIBLE
+            attachBannerCardTo(bannerSlotTsd)
+        } else if (showListScreen) {
+            cameraSection.visibility = View.GONE
+            listSection.visibility = View.VISIBLE
+            phoneListTopBar.visibility = View.VISIBLE
+            bannerSlotTsd.visibility = View.GONE
+            tvPhoneListTitle.text = "Отсканировано: ${items.size}"
+            tvPhoneListTitle.textSize = spSize(15f)
+            tvPhoneListTitle.setTextColor(p.textPrimary)
+        } else {
+            cameraSection.visibility = View.VISIBLE
+            listSection.visibility = View.GONE
+            bottomHud.setBackgroundColor(Color.argb(235, Color.red(p.bg), Color.green(p.bg), Color.blue(p.bg)))
+            attachBannerCardTo(bannerSlotCamera)
+        }
+
+        // Счётчики
+        val expiredCount = items.count { isItemExpired(it) }
+        val noDateCount = items.count { it.expDate == null && !it.isLoading }
+
+        tvStatAll.text = "${items.size}\nВсего ↗"
+        tvStatAll.textSize = spSize(12f)
+        tvStatAll.setTextColor(p.textPrimary)
+        tvStatAll.background = roundedBg(p.surface, 10, p.border, 1)
+
+        tvStatExpired.text = "$expiredCount\nПросрочка ↗"
+        tvStatExpired.textSize = spSize(12f)
+        tvStatExpired.setTextColor(Color.parseColor("#EF4444"))
+        tvStatExpired.background = roundedBg(p.surface, 10, p.border, 1)
+
+        tvStatNoDate.text = "$noDateCount\nБез даты ↗"
+        tvStatNoDate.textSize = spSize(12f)
+        tvStatNoDate.setTextColor(Color.parseColor("#F59E0B"))
+        tvStatNoDate.background = roundedBg(p.surface, 10, p.border, 1)
+
+        // Вкладки списка
+        for ((tab, tv) in tabViews) {
+            styleChip(tv, selectedTab == tab, p)
+        }
+        styleChip(btnGroupToggle, storage.groupByName, p)
+
+        etSearch.textSize = spSize(13f)
+        etSearch.setTextColor(p.textPrimary)
+        etSearch.setHintTextColor(p.textSecondary)
+        etSearch.background = roundedBg(p.surface, 10, p.border, 1)
+
+        btnCopySummary.background = roundedBg(p.surface, 10, p.border, 1)
+        btnCopySummary.setTextColor(p.textPrimary)
+        btnCopySummary.textSize = spSize(12f)
+
+        btnExportAll.background = roundedBg(p.surface, 10, p.border, 1)
+        btnExportAll.setTextColor(p.textPrimary)
+        btnExportAll.textSize = spSize(12f)
+        btnExportExpired.textSize = spSize(12f)
+
+        updateActiveBannerCard(p)
+        refreshListOnly()
+    }
+
+    private fun styleChip(tv: TextView, active: Boolean, p: ThemePalette) {
+        tv.textSize = spSize(12f)
+        tv.background = roundedBg(if (active) p.primary else p.surfaceAlt, 8)
+        tv.setTextColor(if (active) Color.WHITE else p.textPrimary)
+    }
+
+    private fun attachBannerCardTo(target: FrameLayout) {
+        val currentParent = activeBannerCard.parent as? ViewGroup
+        if (currentParent !== target) {
+            currentParent?.removeView(activeBannerCard)
+            target.addView(activeBannerCard)
+        }
+    }
+
+    private fun updateActiveBannerCard(p: ThemePalette) {
+        val item = items.find { it.uniqueKey == activeBannerKey } ?: items.firstOrNull()
+        val large = storage.tsdMode
+
+        if (item == null) {
+            activeBannerCard.background = roundedBg(p.surface, 12, p.border, 1)
+            tvBannerStatus.text = "Наведите сканер на DataMatrix «Честного ЗНАКа»"
+            tvBannerStatus.setTextColor(p.textSecondary)
+            tvBannerStatus.textSize = spSize(if (large) 15f else 13f)
+            tvBannerDuplicateBadge.visibility = View.GONE
+            tvBannerName.visibility = View.GONE
+            tvBannerDate.visibility = View.GONE
+            fifoContainerBanner.visibility = View.GONE
+            return
+        }
+
+        tvBannerName.visibility = View.VISIBLE
+        tvBannerDate.visibility = View.VISIBLE
+
+        val expired = isItemExpired(item)
+        val borderColor = when {
+            item.isLoading -> Color.parseColor("#3B82F6")
+            expired -> Color.parseColor("#EF4444")
+            item.expDate != null -> Color.parseColor("#10B981")
+            else -> Color.parseColor("#F59E0B")
+        }
+
+        activeBannerCard.background = roundedBg(p.surface, 12, borderColor, 2)
+
+        tvBannerStatus.text = when {
+            item.isLoading -> "⏳ Запрос в Честный ЗНАК..."
+            item.status == "RETIRED" -> "⛔ ВЫБЫЛ ИЗ ОБОРОТА!"
+            expired -> "🚨 ПРОСРОЧКА / СПИСАТЬ"
+            item.expDate != null -> "✅ ГОДЕН"
+            else -> "⚠️ НЕТ ДАТЫ В ЧЗ"
+        }
+        tvBannerStatus.setTextColor(borderColor)
+        tvBannerStatus.textSize = spSize(if (large) 15f else 13f)
+
+        tvBannerDuplicateBadge.visibility = if (isDuplicateBanner) View.VISIBLE else View.GONE
+        tvBannerDuplicateBadge.background = roundedBg(p.surfaceAlt, 6)
+        tvBannerDuplicateBadge.setTextColor(p.textSecondary)
+        tvBannerDuplicateBadge.textSize = spSize(11f)
+
+        tvBannerName.text = item.name ?: "GTIN: ${item.gtin}"
+        tvBannerName.setTextColor(p.textPrimary)
+        tvBannerName.textSize = spSize(if (large) 16f else 14f)
+
+        tvBannerDate.text = when {
+            item.expDate != null -> "Срок годности: до ${formatRuDate(item.expDate)}"
+            !item.infoMsg.isNullOrBlank() -> item.infoMsg
+            else -> "GTIN ${item.gtin} • SN: ${item.sn}"
+        }
+        tvBannerDate.setTextColor(if (expired) Color.parseColor("#EF4444") else p.textPrimary)
+        tvBannerDate.setTypeface(null, if (item.expDate != null) Typeface.BOLD else Typeface.NORMAL)
+        tvBannerDate.textSize = spSize(if (large) 15f else 13f)
+
+        if (storage.fifoBarEnabled && item.expDate != null) {
+            val expMs = parseIsoToMillis(item.expDate)
+            if (expMs != null) {
+                fifoContainerBanner.visibility = View.VISIBLE
+                val daysLeft = ((expMs - todayZeroMillis()) / 86_400_000L).toInt()
+                val (barColor, widthDp, label) = when {
+                    expMs <= thresholdMillis() -> Triple(Color.parseColor("#EF4444"), 180, "Списать")
+                    daysLeft <= 3 -> Triple(Color.parseColor("#F59E0B"), 115, "Ротация ($daysLeft дн.)")
+                    else -> Triple(Color.parseColor("#10B981"), 65, "Запас ($daysLeft дн.)")
+                }
+                fifoFillBanner.background = roundedBg(barColor, 4)
+                fifoFillBanner.layoutParams = FrameLayout.LayoutParams(dp(widthDp), ViewGroup.LayoutParams.MATCH_PARENT)
+                tvFifoLabelBanner.text = label
+                tvFifoLabelBanner.setTextColor(barColor)
+                tvFifoLabelBanner.textSize = spSize(10f)
+            } else {
+                fifoContainerBanner.visibility = View.GONE
+            }
+        } else {
+            fifoContainerBanner.visibility = View.GONE
+        }
+    }
+
+    private fun refreshListOnly() {
+        listAdapter.rebuildData()
+        listAdapter.notifyDataSetChanged()
+    }
+
+    // ==================== АДАПТЕР СПИСКА (ОБЫЧНЫЙ + АККОРДЕОН ГРУППЫ) ====================
+
+    private inner class ScanListAdapter : BaseAdapter() {
+        private sealed class RowEntry {
+            data class Single(val item: ScannedItem) : RowEntry()
+            data class Group(val title: String, val units: List<ScannedItem>) : RowEntry()
+        }
+
+        private var rows: List<RowEntry> = emptyList()
+
+        fun rebuildData() {
+            val q = searchQuery.trim().lowercase(Locale.getDefault())
+            val filtered = items.filter { item ->
+                val tabMatch = when (selectedTab) {
+                    FilterTab.ALL -> true
+                    FilterTab.EXPIRED -> isItemExpired(item)
+                    FilterTab.VALID -> item.expDate != null && !isItemExpired(item)
+                    FilterTab.NO_DATE -> item.expDate == null && !item.isLoading
+                }
+                val queryMatch = q.isEmpty() ||
+                    (item.name?.lowercase(Locale.getDefault())?.contains(q) == true) ||
+                    item.gtin.contains(q) ||
+                    item.sn.lowercase(Locale.getDefault()).contains(q)
+                tabMatch && queryMatch
+            }
+
+            rows = if (storage.groupByName) {
+                filtered
+                    .groupBy { it.name?.trim()?.takeIf { n -> n.isNotEmpty() } ?: "GTIN: ${it.gtin}" }
+                    .map { (title, list) -> RowEntry.Group(title, list) }
+            } else {
+                filtered.map { RowEntry.Single(it) }
+            }
+        }
+
+        override fun getCount(): Int = rows.size
+        override fun getItem(position: Int): Any = rows[position]
+        override fun getItemId(position: Int): Long = position.toLong()
+
+        override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
+            val p = palette()
+            return when (val entry = rows[position]) {
+                is RowEntry.Single -> buildSingleCard(entry.item, p, compact = false)
+                is RowEntry.Group -> buildGroupCard(entry.title, entry.units, p)
+            }
+        }
+
+        private fun buildGroupCard(title: String, units: List<ScannedItem>, p: ThemePalette): View {
+            val isExpanded = title in expandedGroups
+            val expCount = units.count { isItemExpired(it) }
+            val borderColor = if (expCount > 0) Color.parseColor("#EF4444") else p.border
+
+            val card = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(11), dp(10), dp(11), dp(10))
+                background = roundedBg(p.surface, 10, borderColor, if (expCount > 0) 2 else 1)
+            }
+
+            val headerRow = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setOnClickListener {
+                    if (isExpanded) expandedGroups.remove(title) else expandedGroups.add(title)
+                    notifyDataSetChanged()
+                }
+            }
+
+            val leftCol = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            leftCol.addView(TextView(this@MainActivity).apply {
+                text = title
+                setTypeface(null, Typeface.BOLD)
+                textSize = spSize(14f)
+                setTextColor(p.textPrimary)
+            })
+
+            val summaryLine = if (expCount > 0) {
+                "Всего: ${units.size} шт.  •  Просрочка: $expCount"
+            } else {
+                "Всего: ${units.size} шт."
+            }
+            leftCol.addView(TextView(this@MainActivity).apply {
+                text = summaryLine
+                textSize = spSize(12f)
+                setTypeface(null, if (expCount > 0) Typeface.BOLD else Typeface.NORMAL)
+                setTextColor(if (expCount > 0) Color.parseColor("#EF4444") else p.textSecondary)
+                setPadding(0, dp(3), 0, 0)
+            })
+
+            val arrow = TextView(this@MainActivity).apply {
+                text = if (isExpanded) "▲" else "▼"
+                textSize = spSize(14f)
+                setTextColor(p.textSecondary)
+                setPadding(dp(8), 0, dp(4), 0)
+            }
+
+            headerRow.addView(leftCol)
+            headerRow.addView(arrow)
+            card.addView(headerRow)
+
+            if (isExpanded) {
+                val sep = View(this@MainActivity).apply {
+                    setBackgroundColor(p.border)
+                    layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)).apply {
+                        topMargin = dp(8)
+                        bottomMargin = dp(6)
+                    }
+                }
+                card.addView(sep)
+
+                for (sub in units) {
+                    val subRow = buildSingleCard(sub, p, compact = true)
+                    (subRow.layoutParams as? LinearLayout.LayoutParams)?.bottomMargin = dp(5)
+                    card.addView(subRow)
+                }
+            }
+
+            return card
+        }
+
+        private fun buildSingleCard(item: ScannedItem, p: ThemePalette, compact: Boolean): View {
+            val expired = isItemExpired(item)
+            val borderColor = when {
+                item.isLoading -> p.primary
+                expired -> Color.parseColor("#EF4444")
+                item.expDate != null -> Color.parseColor("#10B981")
+                else -> Color.parseColor("#F59E0B")
+            }
+
+            val row = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(10), dp(8), dp(8), dp(8))
+                background = roundedBg(if (compact) p.surfaceAlt else p.surface, 10, borderColor, 1)
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            }
+
+            val infoCol = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
+
+            if (!compact) {
+                infoCol.addView(TextView(this@MainActivity).apply {
+                    text = item.name ?: "Загрузка названия..."
+                    setTypeface(null, Typeface.BOLD)
+                    textSize = spSize(14f)
+                    setTextColor(p.textPrimary)
+                })
+            }
+
+            infoCol.addView(TextView(this@MainActivity).apply {
+                text = "GTIN: ${item.gtin} • SN: ${item.sn}"
+                textSize = spSize(11f)
+                setTextColor(p.textSecondary)
+                setPadding(0, dp(2), 0, dp(2))
+            })
+
+            val statusText = when {
+                item.isLoading -> "Проверка в Честном ЗНАКе..."
+                item.status == "RETIRED" -> "ВЫБЫЛ (до ${formatRuDate(item.expDate)})"
+                expired && item.expDate != null -> "ПРОСРОЧКА: до ${formatRuDate(item.expDate)}"
+                item.expDate != null -> "Годен: до ${formatRuDate(item.expDate)}"
+                else -> item.infoMsg ?: "Срок не указан"
+            }
+            infoCol.addView(TextView(this@MainActivity).apply {
+                text = statusText
+                setTypeface(null, Typeface.BOLD)
+                textSize = spSize(13f)
+                setTextColor(borderColor)
+            })
+
+            val btnDel = TextView(this@MainActivity).apply {
+                text = "✕"
+                textSize = spSize(15f)
+                setTextColor(p.textSecondary)
+                setPadding(dp(10), dp(6), dp(8), dp(6))
+                setOnClickListener {
+                    items.removeAll { it.uniqueKey == item.uniqueKey }
+                    storage.saveItems(items)
+                    refreshAllUi()
+                }
+            }
+
+            row.addView(infoCol)
+            row.addView(btnDel)
+            return row
+        }
+    }
+
+    // ==================== ОБРАБОТКА СКАНОВ И ОЧЕРЕДЬ API ====================
+
+    private fun onRawBarcodeDetected(rawText: String) {
+        val parsed = CrptParser.parse(rawText) ?: return
+        val now = System.currentTimeMillis()
+        if (lastScanKey == parsed.uniqueKey && now - lastScanTime < 1100L) return
+        lastScanKey = parsed.uniqueKey
+        lastScanTime = now
+
+        mainHandler.post {
+            val existing = items.find { it.uniqueKey == parsed.uniqueKey }
+            if (existing != null) {
+                // Повторное наведение: показываем срок годности уже отсканированного товара!
+                activeBannerKey = existing.uniqueKey
+                isDuplicateBanner = true
+                triggerFeedback(expired = isItemExpired(existing), isDuplicate = true)
+                refreshAllUi()
+                return@post
+            }
+
+            isDuplicateBanner = false
+            activeBannerKey = parsed.uniqueKey
+            items.add(
+                0,
+                ScannedItem(
+                    uniqueKey = parsed.uniqueKey,
+                    gtin = parsed.gtin,
+                    sn = parsed.sn,
+                    raw = parsed.raw,
+                    isLoading = true
+                )
+            )
+            storage.saveItems(items)
+            refreshAllUi()
+            apiQueue.trySend(parsed)
+        }
+    }
+
+    private fun startApiWorker() {
+        uiScope.launch {
+            for (task in apiQueue) {
+                delay(350L + Random.nextLong(50L, 140L))
+                var attempt = 0
+                var done = false
+
+                while (attempt < 3 && !done) {
+                    attempt++
+                    if (attempt > 1) {
+                        updateSingleItem(task.uniqueKey) {
+                            it.copy(infoMsg = "Повтор запроса ($attempt/3)...")
+                        }
+                        delay(2200L * (attempt - 1))
+                    }
+
+                    val res = fetchFromGateway(
+                        endpoint = storage.apiUrl,
+                        mode = storage.apiMode,
+                        token = storage.apiToken,
+                        parsed = task
+                    )
+
+                    if (res.shouldRetry && attempt < 3) continue
+
+                    done = true
+                    updateSingleItem(task.uniqueKey) {
+                        it.copy(
+                            name = res.name ?: it.name,
+                            expDate = res.expDate,
+                            status = res.status,
+                            infoMsg = res.error,
+                            isLoading = false
+                        )
+                    }
+
+                    val updated = items.find { it.uniqueKey == task.uniqueKey }
+                    if (updated != null && (updated.expDate != null || updated.status == "RETIRED")) {
+                        triggerFeedback(expired = isItemExpired(updated), isDuplicate = false)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun updateSingleItem(key: String, transform: (ScannedItem) -> ScannedItem) {
+        val idx = items.indexOfFirst { it.uniqueKey == key }
+        if (idx != -1) {
+            items[idx] = transform(items[idx])
+            storage.saveItems(items)
+            refreshAllUi()
+        }
+    }
+
+    private fun triggerFeedback(expired: Boolean, isDuplicate: Boolean) {
+        val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager)?.defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
         }
 
         if (isDuplicate) {
@@ -504,15 +1877,11 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
                 @Suppress("DEPRECATION")
                 vibrator?.vibrate(longArrayOf(0, 220, 90, 220), -1)
             }
-            if (soundEnabled) {
+            if (storage.soundEnabled) {
                 toneGen?.startTone(ToneGenerator.TONE_CDMA_EMERGENCY_RINGBACK, 350)
             }
-            if (flashEnabled) {
-                flashType = FlashType.EXPIRED
-                scope.launch {
-                    delay(480)
-                    flashType = FlashType.NONE
-                }
+            if (storage.flashEnabled) {
+                showScreenFlash(Color.parseColor("#EF4444"), 460L)
             }
         } else {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -521,1763 +1890,372 @@ fun AorScannerApp(hardwareScanFlow: Channel<String>) {
                 @Suppress("DEPRECATION")
                 vibrator?.vibrate(38)
             }
-            if (soundEnabled) {
+            if (storage.soundEnabled) {
                 toneGen?.startTone(ToneGenerator.TONE_PROP_BEEP, 110)
             }
-            if (flashEnabled) {
-                flashType = FlashType.VALID
-                scope.launch {
-                    delay(350)
-                    flashType = FlashType.NONE
-                }
+            if (storage.flashEnabled) {
+                showScreenFlash(Color.parseColor("#10B981"), 320L)
             }
         }
     }
 
-    var lastScanStamp by remember { mutableStateOf("" to 0L) }
-
-    fun onRawBarcodeDetected(rawText: String) {
-        val parsed = CrptParser.parse(rawText) ?: return
-        val now = System.currentTimeMillis()
-        if (lastScanStamp.first == parsed.uniqueKey && now - lastScanStamp.second < 1100L) {
-            return
+    private fun showScreenFlash(color: Int, durationMs: Long) {
+        val gd = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            setColor(Color.argb(55, Color.red(color), Color.green(color), Color.blue(color)))
+            setStroke(dp(10), color)
         }
-        lastScanStamp = parsed.uniqueKey to now
-
-        val existing = items.find { it.uniqueKey == parsed.uniqueKey }
-        if (existing != null) {
-            activeBannerKey = existing.uniqueKey
-            isDuplicateBanner = true
-            triggerFeedback(expired = isExpired(existing.expDate), isDuplicate = true)
-            return
-        }
-
-        isDuplicateBanner = false
-        activeBannerKey = parsed.uniqueKey
-        val newItem = ScannedItem(
-            uniqueKey = parsed.uniqueKey,
-            gtin = parsed.gtin,
-            sn = parsed.sn,
-            raw = parsed.raw,
-            isLoading = true
-        )
-        updateItems(listOf(newItem) + items)
-        apiQueue.trySend(parsed)
+        flashOverlay.background = gd
+        flashOverlay.visibility = View.VISIBLE
+        mainHandler.removeCallbacksAndMessages("flash_hide")
+        mainHandler.postDelayed({ flashOverlay.visibility = View.GONE }, durationMs)
     }
 
-    LaunchedEffect(Unit) {
-        for (task in apiQueue) {
-            delay(350L + Random.nextLong(50L, 140L))
-            var attempt = 0
-            var done = false
+    // ==================== КАМЕРА CAMERAX С МАКРО 0.6X ====================
 
-            while (attempt < 3 && !done) {
-                attempt++
-                if (attempt > 1) {
-                    updateItems(items.map {
-                        if (it.uniqueKey == task.uniqueKey) {
-                            it.copy(infoMsg = "Повтор запроса ($attempt/3)...")
-                        } else it
-                    })
-                    delay(2200L * (attempt - 1))
-                }
-
-                val res = fetchFromGateway(
-                    endpoint = storage.apiUrl,
-                    mode = storage.apiMode,
-                    token = storage.apiToken,
-                    parsed = task
-                )
-
-                if (res.shouldRetry && attempt < 3) {
-                    continue
-                }
-
-                done = true
-                val expFlag = isExpired(res.expDate) || res.status == "RETIRED"
-                updateItems(items.map {
-                    if (it.uniqueKey == task.uniqueKey) {
-                        it.copy(
-                            name = res.name ?: it.name,
-                            expDate = res.expDate,
-                            status = res.status,
-                            infoMsg = res.error,
-                            isLoading = false
-                        )
-                    } else it
-                })
-
-                if (res.expDate != null || res.status == "RETIRED") {
-                    triggerFeedback(expired = expFlag, isDuplicate = false)
-                }
-            }
-        }
-    }
-
-    LaunchedEffect(Unit) {
-        for (hwCode in hardwareScanFlow) {
-            onRawBarcodeDetected(hwCode)
-        }
-    }
-
-    DisposableEffect(context) {
-        val receiver = object : BroadcastReceiver() {
-            override fun onReceive(ctx: Context?, intent: Intent?) {
-                if (intent == null) return
-                val code = intent.getStringExtra("scannerdata")
-                    ?: intent.getStringExtra("barcode_string")
-                    ?: intent.getStringExtra("data")
-                    ?: intent.getStringExtra("SCAN_BARCODE1")
-                    ?: intent.getStringExtra("value")
-                if (!code.isNullOrBlank()) {
-                    onRawBarcodeDetected(code)
-                }
-            }
-        }
-        val filter = IntentFilter().apply {
-            addAction("com.android.server.scannerservice.broadcast")
-            addAction("android.intent.ACTION_DECODE_DATA")
-            addAction("nlscan.action.SCANNER_RESULT")
-            addAction("com.scanner.broadcast")
-        }
-        if (Build.VERSION.SDK_INT >= 33) {
-            context.registerReceiver(receiver, filter, 2)
+    private fun ensureCameraStarted() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            tvPermissionHint.visibility = View.GONE
+            startCameraIfNeeded()
         } else {
-            @Suppress("DEPRECATION")
-            context.registerReceiver(receiver, filter)
-        }
-        onDispose {
-            context.unregisterReceiver(receiver)
+            cameraPermLauncher.launch(Manifest.permission.CAMERA)
         }
     }
 
-    LaunchedEffect(tsdMode) {
-        if (!tsdMode && !hasCameraPermission) {
-            permissionLauncher.launch(Manifest.permission.CAMERA)
-        }
-    }
+    @SuppressLint("UnsafeOptInUsageError")
+    private fun startCameraIfNeeded() {
+        if (storage.tsdMode) return
+        val future = ProcessCameraProvider.getInstance(this)
+        future.addListener({
+            val provider = future.get()
+            cameraProvider = provider
 
-    var csvContentToSave by remember { mutableStateOf("") }
-    val csvLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.CreateDocument("text/csv")
-    ) { uri ->
-        if (uri != null) {
+            val preview = Preview.Builder().build().also {
+                it.setSurfaceProvider(previewView.surfaceProvider)
+            }
+
+            val options = BarcodeScannerOptions.Builder()
+                .setBarcodeFormats(Barcode.FORMAT_DATA_MATRIX)
+                .build()
+            val scanner = BarcodeScanning.getClient(options)
+
+            val analysis = ImageAnalysis.Builder()
+                .setTargetResolution(Size(1280, 720))
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .build()
+
+            analysis.setAnalyzer(cameraExecutor) { imageProxy: ImageProxy ->
+                val mediaImage = imageProxy.image
+                if (mediaImage != null) {
+                    if (!fullFrameScan) {
+                        val w = mediaImage.width
+                        val h = mediaImage.height
+                        val cropSize = (minOf(w, h) * 0.56f).toInt()
+                        val left = (w - cropSize) / 2
+                        val top = (h - cropSize) / 2
+                        imageProxy.setCropRect(Rect(left, top, left + cropSize, top + cropSize))
+                    }
+                    val input = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
+                    scanner.process(input)
+                        .addOnSuccessListener { barcodes ->
+                            for (b in barcodes) {
+                                val raw = b.rawValue
+                                if (!raw.isNullOrBlank()) {
+                                    onRawBarcodeDetected(raw)
+                                    break
+                                }
+                            }
+                        }
+                        .addOnCompleteListener { imageProxy.close() }
+                } else {
+                    imageProxy.close()
+                }
+            }
+
             try {
-                context.contentResolver.openOutputStream(uri)?.use { out ->
-                    OutputStreamWriter(out, StandardCharsets.UTF_8).use { writer ->
-                        writer.write("\uFEFF")
-                        writer.write(csvContentToSave)
-                    }
-                }
-                Toast.makeText(context, "CSV успешно сохранён", Toast.LENGTH_SHORT).show()
-            } catch (e: Exception) {
-                Toast.makeText(context, "Ошибка сохранения: ${e.message}", Toast.LENGTH_LONG).show()
-            }
-        }
-    }
-
-    val colors = if (darkTheme) DarkScheme else LightScheme
-    val baseDensity = LocalDensity.current
-    val scaledDensity = remember(baseDensity, largeFont) {
-        Density(
-            density = baseDensity.density,
-            fontScale = baseDensity.fontScale * (if (largeFont) 1.22f else 1.0f)
-        )
-    }
-
-    val flashAlpha by animateFloatAsState(
-        targetValue = if (flashType != FlashType.NONE) 0.45f else 0f,
-        animationSpec = tween(durationMillis = 220),
-        label = "flashAlpha"
-    )
-
-    CompositionLocalProvider(LocalDensity provides scaledDensity) {
-        MaterialTheme(colorScheme = colors) {
-            ModalNavigationDrawer(
-                drawerState = drawerState,
-                gesturesEnabled = !isShelfLocked,
-                drawerContent = {
-                    ModalDrawerSheet(
-                        drawerContainerColor = MaterialTheme.colorScheme.surface,
-                        modifier = Modifier.width(310.dp)
-                    ) {
-                        DrawerSettingsContent(
-                            tsdMode = tsdMode,
-                            onTsdModeChange = {
-                                tsdMode = it
-                                storage.tsdMode = it
-                                if (it) {
-                                    torchEnabled = false
-                                    showListScreen = false
-                                }
-                            },
-                            darkTheme = darkTheme,
-                            onDarkThemeChange = {
-                                darkTheme = it
-                                storage.darkTheme = it
-                            },
-                            largeFont = largeFont,
-                            onLargeFontChange = {
-                                largeFont = it
-                                storage.largeFont = it
-                            },
-                            flashEnabled = flashEnabled,
-                            onFlashEnabledChange = {
-                                flashEnabled = it
-                                storage.flashEnabled = it
-                            },
-                            fifoBarEnabled = fifoBarEnabled,
-                            onFifoBarEnabledChange = {
-                                fifoBarEnabled = it
-                                storage.fifoBarEnabled = it
-                            },
-                            soundEnabled = soundEnabled,
-                            onSoundEnabledChange = {
-                                soundEnabled = it
-                                storage.soundEnabled = it
-                            },
-                            apiUrl = apiUrl,
-                            onApiUrlChange = { apiUrl = it },
-                            apiMode = apiMode,
-                            onApiModeChange = { apiMode = it },
-                            apiToken = apiToken,
-                            onApiTokenChange = { apiToken = it },
-                            onSaveApi = {
-                                storage.apiUrl = apiUrl
-                                storage.apiMode = apiMode
-                                storage.apiToken = apiToken
-                                Toast.makeText(context, "Настройки шлюза сохранены", Toast.LENGTH_SHORT).show()
-                            },
-                            onOpenManualAdd = {
-                                scope.launch { drawerState.close() }
-                                showManualAddDialog = true
-                            }
-                        )
-                    }
-                }
-            ) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(MaterialTheme.colorScheme.background)
-                ) {
-                    if (showListScreen && !tsdMode) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .statusBarsPadding()
-                                .padding(horizontal = 12.dp)
-                        ) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(vertical = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                SmallActionChip(text = "← К камере", onClick = { showListScreen = false })
-                                Text(
-                                    text = "Отсканировано: ${items.size}",
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 15.sp,
-                                    color = MaterialTheme.colorScheme.onBackground
-                                )
-                                SmallActionChip(
-                                    text = "Очистить",
-                                    onClick = { if (items.isNotEmpty()) showResetConfirm = true }
-                                )
-                            }
-
-                            ScannedListSection(
-                                items = items,
-                                selectedTab = selectedTab,
-                                onSelectTab = { selectedTab = it },
-                                searchQuery = searchQuery,
-                                onSearchChange = { searchQuery = it },
-                                groupByName = groupByName,
-                                onToggleGroup = {
-                                    groupByName = it
-                                    storage.groupByName = it
-                                },
-                                expandedGroups = expandedGroups,
-                                onToggleGroupExpand = { key ->
-                                    expandedGroups = if (key in expandedGroups) expandedGroups - key else expandedGroups + key
-                                },
-                                isExpiredFn = { isExpired(it.expDate) || it.status == "RETIRED" },
-                                todayMillis = todayMillis,
-                                thresholdMillis = thresholdMillis,
-                                fifoBarEnabled = fifoBarEnabled,
-                                onDeleteItem = { key -> updateItems(items.filterNot { it.uniqueKey == key }) },
-                                onExportExpiredCsv = {
-                                    csvContentToSave = buildCsv(items.filter { isExpired(it.expDate) || it.status == "RETIRED" }, thresholdMillis)
-                                    csvLauncher.launch("AOR_Prosrochka_${formatIsoFileDate()}.csv")
-                                },
-                                onExportAllCsv = {
-                                    csvContentToSave = buildCsv(items, thresholdMillis)
-                                    csvLauncher.launch("AOR_Reviziya_${formatIsoFileDate()}.csv")
-                                },
-                                onCopySummary = {
-                                    val txt = buildMessengerSummary(items, thresholdMillis) { isExpired(it.expDate) || it.status == "RETIRED" }
-                                    clipboard.setText(AnnotatedString(txt))
-                                    Toast.makeText(context, "Сводка скопирована для мессенджера", Toast.LENGTH_SHORT).show()
-                                },
-                                modifier = Modifier.weight(1f)
-                            )
-                        }
-                    } else {
-                        Column(modifier = Modifier.fillMaxSize()) {
-                            TopControlHeader(
-                                thresholdMillis = thresholdMillis,
-                                offsetDays = offsetDays,
-                                onSelectOffset = { days ->
-                                    offsetDays = days
-                                    storage.offsetDays = days
-                                },
-                                tsdMode = tsdMode,
-                                zoomPresetIndex = zoomPresetIndex,
-                                onCycleZoom = { zoomPresetIndex = (zoomPresetIndex + 1) % 4 },
-                                torchEnabled = torchEnabled,
-                                onToggleTorch = { torchEnabled = !torchEnabled },
-                                fullFrameScan = fullFrameScan,
-                                onToggleScanArea = { fullFrameScan = !fullFrameScan },
-                                onOpenDrawer = { scope.launch { drawerState.open() } },
-                                onLockScreen = { isShelfLocked = true },
-                                onRequestReset = {
-                                    if (items.isNotEmpty()) showResetConfirm = true
-                                }
-                            )
-
-                            val activeItem = items.find { it.uniqueKey == activeBannerKey } ?: items.firstOrNull()
-                            val expiredCount = items.count { isExpired(it.expDate) || it.status == "RETIRED" }
-                            val noDateCount = items.count { it.expDate == null && !it.isLoading }
-
-                            if (tsdMode) {
-                                Column(
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .padding(horizontal = 10.dp)
-                                ) {
-                                    ActiveScanBannerCard(
-                                        item = activeItem,
-                                        isDuplicate = isDuplicateBanner,
-                                        isExpired = isExpired(activeItem?.expDate) || activeItem?.status == "RETIRED",
-                                        todayMillis = todayMillis,
-                                        thresholdMillis = thresholdMillis,
-                                        fifoBarEnabled = fifoBarEnabled,
-                                        isTsdLarge = true
-                                    )
-
-                                    Spacer(Modifier.height(8.dp))
-
-                                    ScannedListSection(
-                                        items = items,
-                                        selectedTab = selectedTab,
-                                        onSelectTab = { selectedTab = it },
-                                        searchQuery = searchQuery,
-                                        onSearchChange = { searchQuery = it },
-                                        groupByName = groupByName,
-                                        onToggleGroup = {
-                                            groupByName = it
-                                            storage.groupByName = it
-                                        },
-                                        expandedGroups = expandedGroups,
-                                        onToggleGroupExpand = { key ->
-                                            expandedGroups = if (key in expandedGroups) expandedGroups - key else expandedGroups + key
-                                        },
-                                        isExpiredFn = { isExpired(it.expDate) || it.status == "RETIRED" },
-                                        todayMillis = todayMillis,
-                                        thresholdMillis = thresholdMillis,
-                                        fifoBarEnabled = fifoBarEnabled,
-                                        onDeleteItem = { key -> updateItems(items.filterNot { it.uniqueKey == key }) },
-                                        onExportExpiredCsv = {
-                                            csvContentToSave = buildCsv(items.filter { isExpired(it.expDate) || it.status == "RETIRED" }, thresholdMillis)
-                                            csvLauncher.launch("AOR_Prosrochka_${formatIsoFileDate()}.csv")
-                                        },
-                                        onExportAllCsv = {
-                                            csvContentToSave = buildCsv(items, thresholdMillis)
-                                            csvLauncher.launch("AOR_Reviziya_${formatIsoFileDate()}.csv")
-                                        },
-                                        onCopySummary = {
-                                            val txt = buildMessengerSummary(items, thresholdMillis) { isExpired(it.expDate) || it.status == "RETIRED" }
-                                            clipboard.setText(AnnotatedString(txt))
-                                            Toast.makeText(context, "Сводка скопирована для мессенджера", Toast.LENGTH_SHORT).show()
-                                        },
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                }
-                            } else {
-                                Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                                    if (hasCameraPermission) {
-                                        CameraScannerView(
-                                            zoomPresetIndex = zoomPresetIndex,
-                                            torchEnabled = torchEnabled,
-                                            fullFrameScan = fullFrameScan,
-                                            onBarcodeScanned = ::onRawBarcodeDetected
-                                        )
-                                    } else {
-                                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                                            Button(onClick = { permissionLauncher.launch(Manifest.permission.CAMERA) }) {
-                                                Text("Разрешить доступ к камере")
-                                            }
-                                        }
-                                    }
-
-                                    Column(
-                                        modifier = Modifier
-                                            .align(Alignment.BottomCenter)
-                                            .fillMaxWidth()
-                                            .background(MaterialTheme.colorScheme.background.copy(alpha = 0.92f))
-                                            .navigationBarsPadding()
-                                            .padding(10.dp)
-                                    ) {
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                        ) {
-                                            StatCounterChip(
-                                                count = items.size,
-                                                label = "Всего ↗",
-                                                accent = MaterialTheme.colorScheme.onSurface,
-                                                modifier = Modifier.weight(1f),
-                                                onClick = {
-                                                    selectedTab = FilterTab.ALL
-                                                    showListScreen = true
-                                                }
-                                            )
-                                            StatCounterChip(
-                                                count = expiredCount,
-                                                label = "Просрочка ↗",
-                                                accent = Color(0xFFEF4444),
-                                                modifier = Modifier.weight(1f),
-                                                onClick = {
-                                                    selectedTab = FilterTab.EXPIRED
-                                                    showListScreen = true
-                                                }
-                                            )
-                                            StatCounterChip(
-                                                count = noDateCount,
-                                                label = "Без даты ↗",
-                                                accent = Color(0xFFF59E0B),
-                                                modifier = Modifier.weight(1f),
-                                                onClick = {
-                                                    selectedTab = FilterTab.NO_DATE
-                                                    showListScreen = true
-                                                }
-                                            )
-                                        }
-
-                                        Spacer(Modifier.height(8.dp))
-
-                                        ActiveScanBannerCard(
-                                            item = activeItem,
-                                            isDuplicate = isDuplicateBanner,
-                                            isExpired = isExpired(activeItem?.expDate) || activeItem?.status == "RETIRED",
-                                            todayMillis = todayMillis,
-                                            thresholdMillis = thresholdMillis,
-                                            fifoBarEnabled = fifoBarEnabled,
-                                            isTsdLarge = false,
-                                            onClick = { showListScreen = true }
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if (flashAlpha > 0f) {
-                        val flashColor = if (flashType == FlashType.EXPIRED) Color(0xFFEF4444) else Color(0xFF10B981)
-                        Box(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .border(10.dp, flashColor.copy(alpha = flashAlpha * 2f))
-                                .background(flashColor.copy(alpha = flashAlpha * 0.35f))
-                        )
-                    }
-
-                    if (isShelfLocked) {
-                        ShelfLockOverlay(onUnlock = { isShelfLocked = false })
-                    }
-                }
-            }
-
-            if (showResetConfirm) {
-                AlertDialog(
-                    onDismissRequest = { showResetConfirm = false },
-                    title = { Text("Очистить смену?") },
-                    text = { Text("Будут удалены все отсканированные позиции (${items.size} шт.). Это действие нельзя отменить.") },
-                    confirmButton = {
-                        TextButton(
-                            onClick = {
-                                updateItems(emptyList())
-                                activeBannerKey = null
-                                showResetConfirm = false
-                            }
-                        ) {
-                            Text("Очистить", color = Color(0xFFEF4444), fontWeight = FontWeight.Bold)
-                        }
-                    },
-                    dismissButton = {
-                        TextButton(onClick = { showResetConfirm = false }) {
-                            Text("Отмена")
-                        }
-                    }
+                provider.unbindAll()
+                boundCamera = provider.bindToLifecycle(
+                    this,
+                    CameraSelector.DEFAULT_BACK_CAMERA,
+                    preview,
+                    analysis
                 )
+                applyCameraZoom()
+                boundCamera?.cameraControl?.enableTorch(torchEnabled)
+            } catch (_: Exception) {
             }
-
-            if (showManualAddDialog) {
-                ManualAddItemDialog(
-                    existingNames = items.mapNotNull { it.name }.distinct(),
-                    onDismiss = { showManualAddDialog = false },
-                    onAdd = { name, expIso, qty ->
-                        val now = System.currentTimeMillis()
-                        val added = (1..qty).map { idx ->
-                            ScannedItem(
-                                uniqueKey = "MANUAL_${now}_$idx",
-                                gtin = "РУЧНОЙ_ВВОД",
-                                sn = "№$idx",
-                                raw = "",
-                                name = name.ifBlank { "Товар без штрихкода" },
-                                expDate = expIso,
-                                status = "MANUAL",
-                                infoMsg = "Добавлено вручную",
-                                isLoading = false,
-                                isManual = true,
-                                scannedAt = now + idx
-                            )
-                        }
-                        updateItems(added + items)
-                        activeBannerKey = added.first().uniqueKey
-                        isDuplicateBanner = false
-                        showManualAddDialog = false
-                        Toast.makeText(context, "Добавлено: $qty шт.", Toast.LENGTH_SHORT).show()
-                    }
-                )
-            }
-        }
-    }
-}
-
-// ==================== ВЕРХНЯЯ ПАНЕЛЬ ====================
-
-@Composable
-private fun TopControlHeader(
-    thresholdMillis: Long,
-    offsetDays: Int,
-    onSelectOffset: (Int) -> Unit,
-    tsdMode: Boolean,
-    zoomPresetIndex: Int,
-    onCycleZoom: () -> Unit,
-    torchEnabled: Boolean,
-    onToggleTorch: () -> Unit,
-    fullFrameScan: Boolean,
-    onToggleScanArea: () -> Unit,
-    onOpenDrawer: () -> Unit,
-    onLockScreen: () -> Unit,
-    onRequestReset: () -> Unit
-) {
-    val zoomLabel = when (zoomPresetIndex) {
-        0 -> "0.6x"
-        1 -> "1x"
-        2 -> "2x"
-        else -> "3x"
+        }, ContextCompat.getMainExecutor(this))
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(MaterialTheme.colorScheme.surface)
-            .statusBarsPadding()
-            .padding(horizontal = 8.dp, vertical = 6.dp)
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            IconButton(
-                onClick = onOpenDrawer,
-                modifier = Modifier.size(36.dp)
-            ) {
-                Icon(Icons.Default.Menu, contentDescription = "Меню", tint = MaterialTheme.colorScheme.onSurface)
-            }
-
-            Surface(
-                shape = RoundedCornerShape(8.dp),
-                color = MaterialTheme.colorScheme.surfaceVariant,
-                modifier = Modifier.weight(1f)
-            ) {
-                val dateStr = formatShortDayMonth(thresholdMillis)
-                Text(
-                    text = if (tsdMode) "ТСД • До $dateStr" else "До $dateStr",
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 13.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-            }
-
-            if (!tsdMode) {
-                SmallActionChip(text = zoomLabel, onClick = onCycleZoom)
-                SmallActionChip(
-                    text = if (fullFrameScan) "Весь" else "Центр",
-                    onClick = onToggleScanArea
-                )
-                Surface(
-                    shape = RoundedCornerShape(8.dp),
-                    color = if (torchEnabled) Color(0xFFF59E0B) else MaterialTheme.colorScheme.surfaceVariant,
-                    modifier = Modifier.clickable(onClick = onToggleTorch)
-                ) {
-                    Text(
-                        text = "🔦",
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
-                        fontSize = 13.sp
-                    )
-                }
-            }
-
-            IconButton(
-                onClick = onLockScreen,
-                modifier = Modifier
-                    .size(34.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(MaterialTheme.colorScheme.surfaceVariant)
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Lock,
-                    contentDescription = "Замок экрана",
-                    tint = MaterialTheme.colorScheme.onSurface,
-                    modifier = Modifier.size(16.dp)
-                )
-            }
-
-            SmallActionChip(text = "Сброс", onClick = onRequestReset)
-        }
-
-        Spacer(Modifier.height(6.dp))
-
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            val presets = listOf(0 to "Сегодня", 1 to "+1 дн", 3 to "+3 дн", 7 to "+7 дн", 14 to "+14 дн")
-            presets.forEach { (days, label) ->
-                val active = offsetDays == days
-                Surface(
-                    shape = RoundedCornerShape(8.dp),
-                    color = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
-                    modifier = Modifier
-                        .weight(1f)
-                        .clickable { onSelectOffset(days) }
-                ) {
-                    Text(
-                        text = label,
-                        modifier = Modifier.padding(vertical = 6.dp),
-                        textAlign = TextAlign.Center,
-                        fontSize = 12.sp,
-                        fontWeight = if (active) FontWeight.Bold else FontWeight.Medium,
-                        color = if (active) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun SmallActionChip(text: String, onClick: () -> Unit) {
-    Surface(
-        shape = RoundedCornerShape(8.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant,
-        modifier = Modifier.clickable(onClick = onClick)
-    ) {
-        Text(
-            text = text,
-            modifier = Modifier.padding(horizontal = 9.dp, vertical = 7.dp),
-            fontSize = 12.sp,
-            fontWeight = FontWeight.SemiBold,
-            color = MaterialTheme.colorScheme.onSurface
-        )
-    }
-}
-
-// ==================== КАРТОЧКА ТЕКУЩЕГО / ПОСЛЕДНЕГО СКАНА ====================
-
-@Composable
-private fun ActiveScanBannerCard(
-    item: ScannedItem?,
-    isDuplicate: Boolean,
-    isExpired: Boolean,
-    todayMillis: Long,
-    thresholdMillis: Long,
-    fifoBarEnabled: Boolean,
-    isTsdLarge: Boolean,
-    onClick: (() -> Unit)? = null
-) {
-    if (item == null) {
-        Surface(
-            shape = RoundedCornerShape(12.dp),
-            color = MaterialTheme.colorScheme.surface,
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
-            modifier = Modifier
-                .fillMaxWidth()
-                .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
-        ) {
-            Text(
-                text = "Наведите сканер на DataMatrix «Честного ЗНАКа»",
-                modifier = Modifier.padding(if (isTsdLarge) 18.dp else 14.dp),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                fontSize = if (isTsdLarge) 15.sp else 13.sp,
-                textAlign = TextAlign.Center
-            )
-        }
-        return
-    }
-
-    val borderColor = when {
-        item.isLoading -> Color(0xFF3B82F6)
-        isExpired -> Color(0xFFEF4444)
-        item.expDate != null -> Color(0xFF10B981)
-        else -> Color(0xFFF59E0B)
-    }
-
-    val bgTint = when {
-        item.isLoading -> MaterialTheme.colorScheme.surface
-        isExpired -> Color(0xFFEF4444).copy(alpha = 0.14f)
-        item.expDate != null -> Color(0xFF10B981).copy(alpha = 0.12f)
-        else -> Color(0xFFF59E0B).copy(alpha = 0.12f)
-    }
-
-    Surface(
-        shape = RoundedCornerShape(12.dp),
-        color = MaterialTheme.colorScheme.surface,
-        border = BorderStroke(2.dp, borderColor),
-        modifier = Modifier
-            .fillMaxWidth()
-            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
-    ) {
-        Column(
-            modifier = Modifier
-                .background(bgTint)
-                .padding(if (isTsdLarge) 14.dp else 11.dp)
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                val statusTitle = when {
-                    item.isLoading -> "⏳ Запрос в Честный ЗНАК..."
-                    item.status == "RETIRED" -> "⛔ ВЫБЫЛ ИЗ ОБОРОТА!"
-                    isExpired -> "🚨 ПРОСРОЧКА / СПИСАТЬ"
-                    item.expDate != null -> "✅ ГОДЕН"
-                    else -> "⚠️ НЕТ ДАТЫ В ЧЗ"
-                }
-                Text(
-                    text = statusTitle,
-                    color = borderColor,
-                    fontWeight = FontWeight.ExtraBold,
-                    fontSize = if (isTsdLarge) 15.sp else 13.sp
-                )
-
-                if (isDuplicate) {
-                    Surface(
-                        shape = RoundedCornerShape(6.dp),
-                        color = MaterialTheme.colorScheme.surfaceVariant
-                    ) {
-                        Text(
-                            text = "Уже в списке",
-                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
-            }
-
-            Spacer(Modifier.height(4.dp))
-
-            Text(
-                text = item.name ?: "GTIN: ${item.gtin}",
-                fontWeight = FontWeight.Bold,
-                fontSize = if (isTsdLarge) 16.sp else 14.sp,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-                color = MaterialTheme.colorScheme.onSurface
-            )
-
-            Spacer(Modifier.height(3.dp))
-
-            val dateLine = when {
-                item.expDate != null -> "Срок годности: до ${formatRuDate(item.expDate)}"
-                !item.infoMsg.isNullOrBlank() -> item.infoMsg
-                else -> "GTIN ${item.gtin} • SN: ${item.sn}"
-            }
-
-            Text(
-                text = dateLine,
-                fontSize = if (isTsdLarge) 15.sp else 13.sp,
-                fontWeight = if (item.expDate != null) FontWeight.Bold else FontWeight.Normal,
-                color = if (isExpired) Color(0xFFEF4444) else MaterialTheme.colorScheme.onSurface
-            )
-
-            if (fifoBarEnabled && item.expDate != null) {
-                Spacer(Modifier.height(6.dp))
-                FifoFreshnessBar(expDateIso = item.expDate, todayMillis = todayMillis, thresholdMillis = thresholdMillis)
-            }
-        }
-    }
-}
-
-@Composable
-private fun StatCounterChip(
-    count: Int,
-    label: String,
-    accent: Color,
-    modifier: Modifier = Modifier,
-    onClick: () -> Unit
-) {
-    Surface(
-        shape = RoundedCornerShape(10.dp),
-        color = MaterialTheme.colorScheme.surface,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
-        modifier = modifier.clickable(onClick = onClick)
-    ) {
-        Column(
-            modifier = Modifier.padding(vertical = 6.dp, horizontal = 8.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Text(text = count.toString(), fontWeight = FontWeight.ExtraBold, fontSize = 16.sp, color = accent)
-            Text(text = label, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-    }
-}
-
-// ==================== ШКАЛА СВЕЖЕСТИ FIFO ====================
-
-@Composable
-private fun FifoFreshnessBar(expDateIso: String, todayMillis: Long, thresholdMillis: Long) {
-    val expMs = parseIsoToMillis(expDateIso) ?: return
-    val daysLeft = ((expMs - todayMillis) / 86_400_000L).toInt()
-    val (barColor, fraction, label) = when {
-        expMs <= thresholdMillis -> Triple(Color(0xFFEF4444), 1.0f, "Списать")
-        daysLeft <= 3 -> Triple(Color(0xFFF59E0B), 0.65f, "Ротация ($daysLeft дн.)")
-        else -> Triple(Color(0xFF10B981), 0.35f, "Запас ($daysLeft дн.)")
-    }
-
-    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .height(5.dp)
-                .clip(CircleShape)
-                .background(MaterialTheme.colorScheme.surfaceVariant)
-        ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth(fraction)
-                    .fillMaxHeight()
-                    .background(barColor)
-            )
-        }
-        Spacer(Modifier.width(8.dp))
-        Text(text = label, fontSize = 10.sp, color = barColor, fontWeight = FontWeight.SemiBold)
-    }
-}
-
-// ==================== СПИСОК С АККОРДЕОН-ГРУППИРОВКОЙ И ЭКСПОРТОМ ====================
-
-@Composable
-private fun ScannedListSection(
-    items: List<ScannedItem>,
-    selectedTab: FilterTab,
-    onSelectTab: (FilterTab) -> Unit,
-    searchQuery: String,
-    onSearchChange: (String) -> Unit,
-    groupByName: Boolean,
-    onToggleGroup: (Boolean) -> Unit,
-    expandedGroups: Set<String>,
-    onToggleGroupExpand: (String) -> Unit,
-    isExpiredFn: (ScannedItem) -> Boolean,
-    todayMillis: Long,
-    thresholdMillis: Long,
-    fifoBarEnabled: Boolean,
-    onDeleteItem: (String) -> Unit,
-    onExportExpiredCsv: () -> Unit,
-    onExportAllCsv: () -> Unit,
-    onCopySummary: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val filtered = remember(items, selectedTab, searchQuery, thresholdMillis) {
-        items.filter { item ->
-            val tabMatch = when (selectedTab) {
-                FilterTab.ALL -> true
-                FilterTab.EXPIRED -> isExpiredFn(item)
-                FilterTab.VALID -> item.expDate != null && !isExpiredFn(item)
-                FilterTab.NO_DATE -> item.expDate == null && !item.isLoading
-            }
-            val q = searchQuery.trim().lowercase()
-            val queryMatch = q.isEmpty() ||
-                (item.name?.lowercase()?.contains(q) == true) ||
-                item.gtin.contains(q) ||
-                item.sn.lowercase().contains(q)
-            tabMatch && queryMatch
-        }
-    }
-
-    Column(modifier = modifier) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(5.dp)
-        ) {
-            FilterTab.values().forEach { tab ->
-                val active = selectedTab == tab
-                Surface(
-                    shape = RoundedCornerShape(8.dp),
-                    color = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
-                    modifier = Modifier.clickable { onSelectTab(tab) }
-                ) {
-                    Text(
-                        text = tab.title,
-                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
-                        fontSize = 12.sp,
-                        fontWeight = if (active) FontWeight.Bold else FontWeight.Medium,
-                        color = if (active) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
-                    )
-                }
-            }
-
-            Spacer(Modifier.weight(1f))
-
-            Surface(
-                shape = RoundedCornerShape(8.dp),
-                color = if (groupByName) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
-                modifier = Modifier.clickable { onToggleGroup(!groupByName) }
-            ) {
-                Text(
-                    text = "Группы",
-                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = if (groupByName) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
-                )
-            }
-        }
-
-        Spacer(Modifier.height(6.dp))
-
-        OutlinedTextField(
-            value = searchQuery,
-            onValueChange = onSearchChange,
-            placeholder = { Text("Поиск по названию, GTIN или SN...", fontSize = 13.sp) },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(10.dp),
-            trailingIcon = {
-                if (searchQuery.isNotEmpty()) {
-                    IconButton(onClick = { onSearchChange("") }) {
-                        Icon(Icons.Default.Clear, contentDescription = "Очистить")
-                    }
-                }
-            }
-        )
-
-        Spacer(Modifier.height(6.dp))
-
-        LazyColumn(
-            modifier = Modifier.weight(1f),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-            contentPadding = PaddingValues(bottom = 8.dp)
-        ) {
-            if (groupByName) {
-                val grouped = filtered.groupBy { it.name?.trim()?.takeIf { n -> n.isNotEmpty() } ?: "GTIN: ${it.gtin}" }
-                items(grouped.entries.toList(), key = { it.key }) { (groupTitle, groupItems) ->
-                    val isExpanded = groupTitle in expandedGroups
-                    val expInGroup = groupItems.count { isExpiredFn(it) }
-                    val groupBorder = if (expInGroup > 0) Color(0xFFEF4444) else MaterialTheme.colorScheme.outline
-
-                    Surface(
-                        shape = RoundedCornerShape(10.dp),
-                        color = MaterialTheme.colorScheme.surface,
-                        border = BorderStroke(if (expInGroup > 0) 1.5.dp else 1.dp, groupBorder),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(modifier = Modifier.padding(10.dp)) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable { onToggleGroupExpand(groupTitle) },
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = groupTitle,
-                                        fontWeight = FontWeight.Bold,
-                                        fontSize = 14.sp,
-                                        color = MaterialTheme.colorScheme.onSurface
-                                    )
-                                    Spacer(Modifier.height(3.dp))
-                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                        Text(
-                                            text = "Всего: ${groupItems.size} шт.",
-                                            fontSize = 12.sp,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                        if (expInGroup > 0) {
-                                            Text(
-                                                text = "• Просрочка: $expInGroup",
-                                                fontSize = 12.sp,
-                                                fontWeight = FontWeight.Bold,
-                                                color = Color(0xFFEF4444)
-                                            )
-                                        }
-                                    }
-                                }
-                                Icon(
-                                    imageVector = if (isExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
-                                    contentDescription = "Раскрыть",
-                                    tint = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-
-                            if (isExpanded) {
-                                Spacer(Modifier.height(8.dp))
-                                Divider(color = MaterialTheme.colorScheme.outline)
-                                Spacer(Modifier.height(6.dp))
-                                groupItems.forEach { subItem ->
-                                    SingleUnitRow(
-                                        item = subItem,
-                                        expired = isExpiredFn(subItem),
-                                        todayMillis = todayMillis,
-                                        thresholdMillis = thresholdMillis,
-                                        fifoBarEnabled = fifoBarEnabled,
-                                        compact = true,
-                                        onDelete = { onDeleteItem(subItem.uniqueKey) }
-                                    )
-                                    Spacer(Modifier.height(4.dp))
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                items(filtered, key = { it.uniqueKey }) { item ->
-                    SingleUnitRow(
-                        item = item,
-                        expired = isExpiredFn(item),
-                        todayMillis = todayMillis,
-                        thresholdMillis = thresholdMillis,
-                        fifoBarEnabled = fifoBarEnabled,
-                        compact = false,
-                        onDelete = { onDeleteItem(item.uniqueKey) }
-                    )
-                }
-            }
-        }
-
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .navigationBarsPadding()
-                .padding(vertical = 6.dp),
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            Button(
-                onClick = onExportExpiredCsv,
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626)),
-                shape = RoundedCornerShape(10.dp),
-                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp),
-                modifier = Modifier.weight(1.2f)
-            ) {
-                Text("📥 CSV Просрочка", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White, maxLines = 1)
-            }
-
-            OutlinedButton(
-                onClick = onCopySummary,
-                shape = RoundedCornerShape(10.dp),
-                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp),
-                modifier = Modifier.weight(1f)
-            ) {
-                Text("📋 Сводка", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
-            }
-
-            OutlinedButton(
-                onClick = onExportAllCsv,
-                shape = RoundedCornerShape(10.dp),
-                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp),
-                modifier = Modifier.weight(0.9f)
-            ) {
-                Text("📥 Всё", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
-            }
-        }
-    }
-}
-
-@Composable
-private fun SingleUnitRow(
-    item: ScannedItem,
-    expired: Boolean,
-    todayMillis: Long,
-    thresholdMillis: Long,
-    fifoBarEnabled: Boolean,
-    compact: Boolean,
-    onDelete: () -> Unit
-) {
-    val borderColor = when {
-        item.isLoading -> MaterialTheme.colorScheme.primary
-        expired -> Color(0xFFEF4444)
-        item.expDate != null -> Color(0xFF10B981)
-        else -> Color(0xFFF59E0B)
-    }
-
-    Surface(
-        shape = RoundedCornerShape(10.dp),
-        color = if (compact) MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f) else MaterialTheme.colorScheme.surface,
-        border = BorderStroke(1.dp, borderColor),
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        Row(
-            modifier = Modifier.padding(10.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                if (!compact) {
-                    Text(
-                        text = item.name ?: "Загрузка названия...",
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 14.sp,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                    Spacer(Modifier.height(2.dp))
-                }
-
-                Text(
-                    text = "GTIN: ${item.gtin} • SN: ${item.sn}",
-                    fontSize = 11.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-
-                Spacer(Modifier.height(3.dp))
-
-                val statusText = when {
-                    item.isLoading -> "Проверка в Честном ЗНАКе..."
-                    item.status == "RETIRED" -> "ВЫБЫЛ (до ${formatRuDate(item.expDate)})"
-                    expired && item.expDate != null -> "ПРОСРОЧКА: до ${formatRuDate(item.expDate)}"
-                    item.expDate != null -> "Годен: до ${formatRuDate(item.expDate)}"
-                    else -> item.infoMsg ?: "Срок не указан"
-                }
-
-                Text(
-                    text = statusText,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = borderColor
-                )
-
-                if (fifoBarEnabled && item.expDate != null && !compact) {
-                    Spacer(Modifier.height(5.dp))
-                    FifoFreshnessBar(expDateIso = item.expDate, todayMillis = todayMillis, thresholdMillis = thresholdMillis)
-                }
-            }
-
-            IconButton(onClick = onDelete, modifier = Modifier.size(30.dp)) {
-                Icon(
-                    imageVector = Icons.Default.Close,
-                    contentDescription = "Удалить",
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.size(16.dp)
-                )
-            }
-        }
-    }
-}
-
-// ==================== БОКОВАЯ ШТОРКА НАСТРОЕК (AOR SYSTEMS) ====================
-
-@Composable
-private fun DrawerSettingsContent(
-    tsdMode: Boolean,
-    onTsdModeChange: (Boolean) -> Unit,
-    darkTheme: Boolean,
-    onDarkThemeChange: (Boolean) -> Unit,
-    largeFont: Boolean,
-    onLargeFontChange: (Boolean) -> Unit,
-    flashEnabled: Boolean,
-    onFlashEnabledChange: (Boolean) -> Unit,
-    fifoBarEnabled: Boolean,
-    onFifoBarEnabledChange: (Boolean) -> Unit,
-    soundEnabled: Boolean,
-    onSoundEnabledChange: (Boolean) -> Unit,
-    apiUrl: String,
-    onApiUrlChange: (String) -> Unit,
-    apiMode: String,
-    onApiModeChange: (String) -> Unit,
-    apiToken: String,
-    onApiTokenChange: (String) -> Unit,
-    onSaveApi: () -> Unit,
-    onOpenManualAdd: () -> Unit
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp)
-    ) {
-        Text(
-            text = "Параметры терминала",
-            fontWeight = FontWeight.ExtraBold,
-            fontSize = 18.sp,
-            color = MaterialTheme.colorScheme.onSurface
-        )
-
-        Spacer(Modifier.height(12.dp))
-
-        DrawerSectionTitle("Оборудование")
-        DrawerSwitchRow(
-            title = "Режим ТСД (без камеры)",
-            subtitle = "Для MERTECH Seuic AutoID Q9C и 2D-сканеров",
-            checked = tsdMode,
-            onCheckedChange = onTsdModeChange
-        )
-
-        Divider(modifier = Modifier.padding(vertical = 8.dp))
-
-        DrawerSectionTitle("Дизайн и индикация")
-        DrawerSwitchRow(
-            title = "Тёмная тема (AMOLED)",
-            subtitle = "Выключите для светлой темы в ярком зале",
-            checked = darkTheme,
-            onCheckedChange = onDarkThemeChange
-        )
-        DrawerSwitchRow(
-            title = "Крупный шрифт",
-            subtitle = "Увеличенный интерфейс для 4\" экранов",
-            checked = largeFont,
-            onCheckedChange = onLargeFontChange
-        )
-        DrawerSwitchRow(
-            title = "Цветовая вспышка экрана",
-            subtitle = "Подсветка краёв зелёным/красным при скане",
-            checked = flashEnabled,
-            onCheckedChange = onFlashEnabledChange
-        )
-        DrawerSwitchRow(
-            title = "Шкала свежести (FIFO)",
-            subtitle = "Индикатор ротации по остатку дней",
-            checked = fifoBarEnabled,
-            onCheckedChange = onFifoBarEnabledChange
-        )
-
-        Divider(modifier = Modifier.padding(vertical = 8.dp))
-
-        DrawerSectionTitle("Звук и ввод")
-        DrawerSwitchRow(
-            title = "Звуковой сигнал",
-            subtitle = "Виброотклик работает всегда даже без звука",
-            checked = soundEnabled,
-            onCheckedChange = onSoundEnabledChange
-        )
-
-        Spacer(Modifier.height(6.dp))
-
-        OutlinedButton(
-            onClick = onOpenManualAdd,
-            shape = RoundedCornerShape(10.dp),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
-            Spacer(Modifier.width(6.dp))
-            Text("Добавить позицию вручную")
-        }
-
-        Divider(modifier = Modifier.padding(vertical = 10.dp))
-
-        DrawerSectionTitle("Настройки API / Шлюз ЧЗ")
-        OutlinedTextField(
-            value = apiUrl,
-            onValueChange = onApiUrlChange,
-            label = { Text("URL шлюза API", fontSize = 12.sp) },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(10.dp)
-        )
-
-        Spacer(Modifier.height(8.dp))
-
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-            listOf("mobile_api" to "Mobile API", "true_api" to "True API").forEach { (mKey, mLabel) ->
-                val active = apiMode == mKey
-                Surface(
-                    shape = RoundedCornerShape(8.dp),
-                    color = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
-                    modifier = Modifier
-                        .weight(1f)
-                        .clickable { onApiModeChange(mKey) }
-                ) {
-                    Text(
-                        text = mLabel,
-                        modifier = Modifier.padding(vertical = 8.dp),
-                        textAlign = TextAlign.Center,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = if (active) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
-                    )
-                }
-            }
-        }
-
-        if (apiMode == "true_api") {
-            Spacer(Modifier.height(6.dp))
-            OutlinedTextField(
-                value = apiToken,
-                onValueChange = onApiTokenChange,
-                label = { Text("Bearer токен", fontSize = 12.sp) },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(10.dp)
-            )
-        }
-
-        Spacer(Modifier.height(8.dp))
-
-        Button(
-            onClick = onSaveApi,
-            shape = RoundedCornerShape(10.dp),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("Сохранить параметры API")
-        }
-
-        Spacer(Modifier.height(24.dp))
-        Divider()
-        Spacer(Modifier.height(12.dp))
-
-        Column(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Text(
-                text = "AOR Systems",
-                fontWeight = FontWeight.ExtraBold,
-                fontSize = 15.sp,
-                letterSpacing = 1.sp,
-                color = MaterialTheme.colorScheme.onSurface
-            )
-            Text(
-                text = "Версия 3.0",
-                fontSize = 12.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-    }
-}
-
-@Composable
-private fun DrawerSectionTitle(text: String) {
-    Text(
-        text = text.uppercase(),
-        fontSize = 11.sp,
-        fontWeight = FontWeight.Bold,
-        color = MaterialTheme.colorScheme.primary,
-        modifier = Modifier.padding(bottom = 4.dp)
-    )
-}
-
-@Composable
-private fun DrawerSwitchRow(
-    title: String,
-    subtitle: String,
-    checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable { onCheckedChange(!checked) }
-            .padding(vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
-            Text(text = title, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
-            Text(text = subtitle, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        Switch(checked = checked, onCheckedChange = onCheckedChange)
-    }
-}
-
-// ==================== ЗАМОК ОТ СЛУЧАЙНЫХ КАСАНИЙ ====================
-
-@Composable
-private fun ShelfLockOverlay(onUnlock: () -> Unit) {
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color.Black.copy(alpha = 0.68f))
-            .pointerInput(Unit) {
-                detectTapGestures(
-                    onLongPress = { onUnlock() }
-                )
-            },
-        contentAlignment = Alignment.Center
-    ) {
-        Surface(
-            shape = RoundedCornerShape(16.dp),
-            color = Color(0xFF131720),
-            border = BorderStroke(1.dp, Color(0xFF3B82F6)),
-            modifier = Modifier.padding(24.dp)
-        ) {
-            Column(
-                modifier = Modifier.padding(20.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Lock,
-                    contentDescription = null,
-                    tint = Color(0xFF3B82F6),
-                    modifier = Modifier.size(36.dp)
-                )
-                Spacer(Modifier.height(10.dp))
-                Text(
-                    text = "Экран заблокирован от полки",
-                    color = Color.White,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 16.sp,
-                    textAlign = TextAlign.Center
-                )
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    text = "Сканер и вибрация активны.\nУдерживайте палец на экране 1 сек, чтобы разблокировать.",
-                    color = Color(0xFF94A3B8),
-                    fontSize = 13.sp,
-                    textAlign = TextAlign.Center
-                )
-            }
-        }
-    }
-}
-
-// ==================== ДИАЛОГ РУЧНОГО ДОБАВЛЕНИЯ ====================
-
-@Composable
-private fun ManualAddItemDialog(
-    existingNames: List<String>,
-    onDismiss: () -> Unit,
-    onAdd: (name: String, expIso: String?, qty: Int) -> Unit
-) {
-    var name by remember { mutableStateOf("") }
-    var dateInput by remember {
-        mutableStateOf(SimpleDateFormat("dd.MM.yyyy", Locale.getDefault()).format(Date()))
-    }
-    var qtyInput by remember { mutableStateOf("1") }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Добавить вручную") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(
-                    value = name,
-                    onValueChange = { name = it },
-                    label = { Text("Наименование товара") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                if (existingNames.isNotEmpty()) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        existingNames.take(2).forEach { suggestion ->
-                            Surface(
-                                shape = RoundedCornerShape(8.dp),
-                                color = MaterialTheme.colorScheme.surfaceVariant,
-                                modifier = Modifier.clickable { name = suggestion }
-                            ) {
-                                Text(
-                                    text = suggestion.take(18),
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                                    fontSize = 11.sp
-                                )
-                            }
-                        }
-                    }
-                }
-                OutlinedTextField(
-                    value = dateInput,
-                    onValueChange = { dateInput = it },
-                    label = { Text("Срок годности (ДД.ММ.ГГГГ)") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value = qtyInput,
-                    onValueChange = { qtyInput = it.filter { ch -> ch.isDigit() } },
-                    label = { Text("Количество (шт.)") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-            }
-        },
-        confirmButton = {
-            TextButton(
-                onClick = {
-                    val iso = parseRuToIso(dateInput)
-                    val qty = (qtyInput.toIntOrNull() ?: 1).coerceIn(1, 99)
-                    onAdd(name.trim(), iso, qty)
-                }
-            ) {
-                Text("Добавить", fontWeight = FontWeight.Bold)
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Отмена") }
-        }
-    )
-}
-
-// ==================== КАМЕРА CAMERAX С МАКРО 0.6X И ML KIT ====================
-
-@SuppressLint("UnsafeOptInUsageError")
-@Composable
-private fun CameraScannerView(
-    zoomPresetIndex: Int,
-    torchEnabled: Boolean,
-    fullFrameScan: Boolean,
-    onBarcodeScanned: (String) -> Unit
-) {
-    val context = LocalContext.current
-    val lifecycleOwner = context as LifecycleOwner
-    val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
-    var cameraRef by remember { mutableStateOf<Camera?>(null) }
-
-    val latestFullFrame by rememberUpdatedState(fullFrameScan)
-    val latestCallback by rememberUpdatedState(onBarcodeScanned)
-
-    LaunchedEffect(cameraRef, torchEnabled) {
-        cameraRef?.cameraControl?.enableTorch(torchEnabled)
-    }
-
-    LaunchedEffect(cameraRef, zoomPresetIndex) {
-        val cam = cameraRef ?: return@LaunchedEffect
-        val zoomState = cam.cameraInfo.zoomState.value ?: return@LaunchedEffect
-        val targetRatio = when (zoomPresetIndex) {
-            0 -> zoomState.minZoomRatio.coerceAtLeast(0.5f)
+    private fun applyCameraZoom() {
+        val cam = boundCamera ?: return
+        val zoomState = cam.cameraInfo.zoomState.value ?: return
+        val target = when (zoomPresetIndex) {
+            0 -> zoomState.minZoomRatio.coerceAtLeast(0.5f) // Ширик / Макро 0.6x
             1 -> 1.0f.coerceIn(zoomState.minZoomRatio, zoomState.maxZoomRatio)
             2 -> 2.0f.coerceIn(zoomState.minZoomRatio, zoomState.maxZoomRatio)
             else -> 3.0f.coerceIn(zoomState.minZoomRatio, zoomState.maxZoomRatio)
         }
-        cam.cameraControl.setZoomRatio(targetRatio)
+        cam.cameraControl.setZoomRatio(target)
     }
 
-    DisposableEffect(Unit) {
-        onDispose { cameraExecutor.shutdown() }
+    // ==================== ДИАЛОГИ ====================
+
+    private fun confirmResetDialog() {
+        AlertDialog.Builder(this)
+            .setTitle("Очистить смену?")
+            .setMessage("Будут удалены все отсканированные позиции (${items.size} шт.). Это действие нельзя отменить.")
+            .setPositiveButton("Очистить") { _, _ ->
+                items.clear()
+                activeBannerKey = null
+                storage.saveItems(items)
+                refreshAllUi()
+            }
+            .setNegativeButton("Отмена", null)
+            .show()
     }
 
-    Box(modifier = Modifier.fillMaxSize()) {
-        AndroidView(
-            factory = { ctx ->
-                val previewView = PreviewView(ctx)
-                val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
-                cameraProviderFuture.addListener({
-                    val provider = cameraProviderFuture.get()
-                    val preview = Preview.Builder().build().also {
-                        it.setSurfaceProvider(previewView.surfaceProvider)
-                    }
+    private fun openManualAddDialog() {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(12), dp(20), dp(8))
+        }
+        val etName = EditText(this).apply {
+            hint = "Наименование товара"
+            isSingleLine = true
+        }
+        val etDate = EditText(this).apply {
+            hint = "Срок годности (ДД.ММ.ГГГГ)"
+            setText(SimpleDateFormat("dd.MM.yyyy", Locale.getDefault()).format(Date()))
+            isSingleLine = true
+        }
+        val etQty = EditText(this).apply {
+            hint = "Количество (шт.)"
+            setText("1")
+            inputType = InputType.TYPE_CLASS_NUMBER
+            isSingleLine = true
+        }
+        box.addView(etName)
+        box.addView(etDate)
+        box.addView(etQty)
 
-                    val options = BarcodeScannerOptions.Builder()
-                        .setBarcodeFormats(Barcode.FORMAT_DATA_MATRIX)
-                        .build()
-                    val scanner = BarcodeScanning.getClient(options)
-
-                    val analysis = ImageAnalysis.Builder()
-                        .setTargetResolution(Size(1280, 720))
-                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                        .build()
-
-                    analysis.setAnalyzer(cameraExecutor) { imageProxy: ImageProxy ->
-                        val mediaImage = imageProxy.image
-                        if (mediaImage != null) {
-                            if (!latestFullFrame) {
-                                val w = mediaImage.width
-                                val h = mediaImage.height
-                                val cropSize = (minOf(w, h) * 0.56f).toInt()
-                                val left = (w - cropSize) / 2
-                                val top = (h - cropSize) / 2
-                                imageProxy.setCropRect(android.graphics.Rect(left, top, left + cropSize, top + cropSize))
-                            }
-                            val input = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
-                            scanner.process(input)
-                                .addOnSuccessListener { barcodes ->
-                                    for (b in barcodes) {
-                                        val raw = b.rawValue
-                                        if (!raw.isNullOrBlank()) {
-                                            latestCallback(raw)
-                                            break
-                                        }
-                                    }
-                                }
-                                .addOnCompleteListener { imageProxy.close() }
-                        } else {
-                            imageProxy.close()
-                        }
-                    }
-
-                    try {
-                        provider.unbindAll()
-                        cameraRef = provider.bindToLifecycle(
-                            lifecycleOwner,
-                            CameraSelector.DEFAULT_BACK_CAMERA,
-                            preview,
-                            analysis
+        AlertDialog.Builder(this)
+            .setTitle("Добавить вручную")
+            .setView(box)
+            .setPositiveButton("Добавить") { _, _ ->
+                val name = etName.text.toString().trim().ifBlank { "Товар без штрихкода" }
+                val iso = parseRuToIso(etDate.text.toString())
+                val qty = (etQty.text.toString().toIntOrNull() ?: 1).coerceIn(1, 99)
+                val now = System.currentTimeMillis()
+                for (idx in 1..qty) {
+                    items.add(
+                        0,
+                        ScannedItem(
+                            uniqueKey = "MANUAL_${now}_$idx",
+                            gtin = "РУЧНОЙ_ВВОД",
+                            sn = "№$idx",
+                            raw = "",
+                            name = name,
+                            expDate = iso,
+                            status = "MANUAL",
+                            infoMsg = "Добавлено вручную",
+                            isLoading = false,
+                            isManual = true,
+                            scannedAt = now + idx
                         )
-                    } catch (_: Exception) {
-                    }
-                }, ContextCompat.getMainExecutor(ctx))
-                previewView
-            },
-            modifier = Modifier.fillMaxSize()
-        )
+                    )
+                }
+                activeBannerKey = items.firstOrNull()?.uniqueKey
+                isDuplicateBanner = false
+                storage.saveItems(items)
+                refreshAllUi()
+                Toast.makeText(this, "Добавлено: $qty шт.", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Отмена", null)
+            .show()
+    }
 
-        if (!fullFrameScan) {
-            Box(
-                modifier = Modifier
-                    .align(Alignment.Center)
-                    .offset(y = (-45).dp)
-                    .size(210.dp)
-                    .border(2.dp, Color(0xFF38BDF8).copy(alpha = 0.75f), RoundedCornerShape(16.dp))
+    // ==================== СЕТЕВОЙ ЗАПРОС К ШЛЮЗУ ====================
+
+    private data class GatewayResult(
+        val expDate: String?,
+        val name: String?,
+        val status: String?,
+        val error: String?,
+        val shouldRetry: Boolean
+    )
+
+    private suspend fun fetchFromGateway(
+        endpoint: String,
+        mode: String,
+        token: String,
+        parsed: ParsedDataMatrix
+    ): GatewayResult = withContext(Dispatchers.IO) {
+        try {
+            val url = URL(endpoint)
+            val conn = (url.openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 15000
+                readTimeout = 20000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                setRequestProperty("X-Api-Mode", mode)
+                if (token.isNotBlank()) {
+                    setRequestProperty("X-Api-Token", token)
+                }
+            }
+
+            val payload = JSONObject().apply {
+                val arr = JSONArray()
+                arr.put(JSONObject().apply {
+                    put("uniqueKey", parsed.uniqueKey)
+                    put("gtin", parsed.gtin)
+                    put("sn", parsed.sn)
+                    put("cis", parsed.cis)
+                    put("raw", parsed.raw)
+                })
+                put("items", arr)
+            }
+
+            conn.outputStream.use { os ->
+                os.write(payload.toString().toByteArray(StandardCharsets.UTF_8))
+            }
+
+            val code = conn.responseCode
+            if (code == 429 || code >= 500) {
+                return@withContext GatewayResult(null, null, null, "Сервер занят ($code)", shouldRetry = true)
+            }
+            if (code !in 200..299) {
+                return@withContext GatewayResult(null, null, null, "Ошибка шлюза HTTP $code", shouldRetry = false)
+            }
+
+            val respText = conn.inputStream.bufferedReader(StandardCharsets.UTF_8).use { it.readText() }
+            val json = JSONObject(respText)
+            val results = json.optJSONArray("results")
+            if (results == null || results.length() == 0) {
+                return@withContext GatewayResult(null, null, null, "Пустой ответ шлюза", shouldRetry = false)
+            }
+
+            val first = results.getJSONObject(0)
+            val err = if (first.isNull("error")) null else first.optString("error")
+            val retryFromCrpt = err != null && (err.contains("429") || err.contains("Таймаут"))
+
+            GatewayResult(
+                expDate = if (first.isNull("expDate")) null else first.optString("expDate"),
+                name = if (first.isNull("name")) null else first.optString("name"),
+                status = if (first.isNull("status")) null else first.optString("status"),
+                error = err,
+                shouldRetry = retryFromCrpt
+            )
+        } catch (e: Exception) {
+            GatewayResult(
+                expDate = null,
+                name = null,
+                status = null,
+                error = "Сбой сети: ${e.localizedMessage ?: "таймаут"}",
+                shouldRetry = true
             )
         }
     }
-}
 
-// ==================== СЕТЕВОЙ ЗАПРОС К ШЛЮЗУ ====================
+    // ==================== ДАТЫ И ОТЧЁТЫ ====================
 
-private data class GatewayResult(
-    val expDate: String?,
-    val name: String?,
-    val status: String?,
-    val error: String?,
-    val shouldRetry: Boolean
-)
+    private fun todayZeroMillis(): Long {
+        val c = Calendar.getInstance()
+        c.set(Calendar.HOUR_OF_DAY, 0)
+        c.set(Calendar.MINUTE, 0)
+        c.set(Calendar.SECOND, 0)
+        c.set(Calendar.MILLISECOND, 0)
+        return c.timeInMillis
+    }
 
-private suspend fun fetchFromGateway(
-    endpoint: String,
-    mode: String,
-    token: String,
-    parsed: ParsedDataMatrix
-): GatewayResult = withContext(Dispatchers.IO) {
-    try {
-        val url = URL(endpoint)
-        val conn = (url.openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            connectTimeout = 15000
-            readTimeout = 20000
-            doOutput = true
-            setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            setRequestProperty("X-Api-Mode", mode)
-            if (token.isNotBlank()) {
-                setRequestProperty("X-Api-Token", token)
+    private fun addDaysToTodayMillis(days: Int): Long {
+        val c = Calendar.getInstance()
+        c.timeInMillis = todayZeroMillis()
+        c.add(Calendar.DAY_OF_YEAR, days)
+        return c.timeInMillis
+    }
+
+    private fun parseIsoToMillis(iso: String?): Long? {
+        if (iso.isNullOrBlank() || iso.length < 10) return null
+        return try {
+            val parts = iso.take(10).split("-")
+            if (parts.size != 3) return null
+            val c = Calendar.getInstance()
+            c.set(Calendar.YEAR, parts[0].toInt())
+            c.set(Calendar.MONTH, parts[1].toInt() - 1)
+            c.set(Calendar.DAY_OF_MONTH, parts[2].toInt())
+            c.set(Calendar.HOUR_OF_DAY, 0)
+            c.set(Calendar.MINUTE, 0)
+            c.set(Calendar.SECOND, 0)
+            c.set(Calendar.MILLISECOND, 0)
+            c.timeInMillis
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun formatShortDayMonth(millis: Long): String =
+        SimpleDateFormat("dd.MM", Locale.getDefault()).format(Date(millis))
+
+    private fun formatIsoFileDate(): String =
+        SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
+
+    private fun formatRuDate(iso: String?): String {
+        if (iso.isNullOrBlank() || iso.length < 10) return "—"
+        val parts = iso.take(10).split("-")
+        return if (parts.size == 3) "${parts[2]}.${parts[1]}.${parts[0]}" else iso
+    }
+
+    private fun parseRuToIso(ru: String): String? {
+        val parts = ru.trim().split(".")
+        if (parts.size != 3) return null
+        val d = parts[0].padStart(2, '0')
+        val m = parts[1].padStart(2, '0')
+        val y = parts[2]
+        return if (y.length == 4) "$y-$m-$d" else null
+    }
+
+    private fun buildCsv(list: List<ScannedItem>): String {
+        val sb = StringBuilder()
+        sb.appendLine("Наименование;GTIN;Серийный номер;Срок годности;Статус;Порог проверки")
+        val thrStr = SimpleDateFormat("dd.MM.yyyy", Locale.getDefault()).format(Date(thresholdMillis()))
+        for (it in list) {
+            val cleanName = (it.name ?: "Не определено").replace(";", ",")
+            val expStr = formatRuDate(it.expDate)
+            val statusStr = when {
+                it.status == "RETIRED" -> "ВЫБЫЛ"
+                isItemExpired(it) -> "ПРОСРОЧКА"
+                it.expDate != null -> "ГОДЕН"
+                else -> it.infoMsg ?: "БЕЗ ДАТЫ"
+            }
+            sb.appendLine("$cleanName;\"${it.gtin}\";\"${it.sn}\";$expStr;$statusStr;$thrStr")
+        }
+        return sb.toString()
+    }
+
+    private fun buildMessengerSummary(): String {
+        val nowStr = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(Date())
+        val thrStr = SimpleDateFormat("dd.MM.yyyy", Locale.getDefault()).format(Date(thresholdMillis()))
+        val expired = items.filter { isItemExpired(it) }
+
+        val sb = StringBuilder()
+        sb.appendLine("📋 Сводка ревизии (AOR Systems)")
+        sb.appendLine("Дата: $nowStr | Порог: до $thrStr")
+        sb.appendLine("Всего проверено: ${items.size} шт. | На списание: ${expired.size} шт.")
+        sb.appendLine()
+
+        if (expired.isEmpty()) {
+            sb.appendLine("✅ Просроченных позиций не обнаружено.")
+        } else {
+            sb.appendLine("🚨 Позиции на списание:")
+            val grouped = expired.groupBy { (it.name ?: "GTIN ${it.gtin}") to formatRuDate(it.expDate) }
+            var idx = 1
+            for ((key, group) in grouped) {
+                sb.appendLine("$idx. ${key.first} — ${group.size} шт. (до ${key.second})")
+                idx++
             }
         }
-
-        val payload = JSONObject().apply {
-            val arr = JSONArray()
-            arr.put(JSONObject().apply {
-                put("uniqueKey", parsed.uniqueKey)
-                put("gtin", parsed.gtin)
-                put("sn", parsed.sn)
-                put("cis", parsed.cis)
-                put("raw", parsed.raw)
-            })
-            put("items", arr)
-        }
-
-        conn.outputStream.use { os ->
-            os.write(payload.toString().toByteArray(StandardCharsets.UTF_8))
-        }
-
-        val code = conn.responseCode
-        if (code == 429 || code >= 500) {
-            return@withContext GatewayResult(null, null, null, "Сервер занят ($code)", shouldRetry = true)
-        }
-        if (code !in 200..299) {
-            return@withContext GatewayResult(null, null, null, "Ошибка шлюза HTTP $code", shouldRetry = false)
-        }
-
-        val respText = conn.inputStream.bufferedReader(StandardCharsets.UTF_8).use { it.readText() }
-        val json = JSONObject(respText)
-        val results = json.optJSONArray("results")
-        if (results == null || results.length() == 0) {
-            return@withContext GatewayResult(null, null, null, "Пустой ответ шлюза", shouldRetry = false)
-        }
-
-        val first = results.getJSONObject(0)
-        val err = if (first.isNull("error")) null else first.optString("error")
-        val retryFromCrpt = err != null && (err.contains("429") || err.contains("Таймаут"))
-
-        GatewayResult(
-            expDate = if (first.isNull("expDate")) null else first.optString("expDate"),
-            name = if (first.isNull("name")) null else first.optString("name"),
-            status = if (first.isNull("status")) null else first.optString("status"),
-            error = err,
-            shouldRetry = retryFromCrpt
-        )
-    } catch (e: Exception) {
-        GatewayResult(
-            expDate = null,
-            name = null,
-            status = null,
-            error = "Сбой сети: ${e.localizedMessage ?: "таймаут"}",
-            shouldRetry = true
-        )
+        return sb.toString()
     }
-}
-
-// ==================== ФОРМАТИРОВАНИЕ ОТЧЁТОВ ====================
-
-private fun buildCsv(list: List<ScannedItem>, thresholdMillis: Long): String {
-    val sb = StringBuilder()
-    sb.appendLine("Наименование;GTIN;Серийный номер;Срок годности;Статус;Порог проверки")
-    val thrStr = SimpleDateFormat("dd.MM.yyyy", Locale.getDefault()).format(Date(thresholdMillis))
-    for (it in list) {
-        val cleanName = (it.name ?: "Не определено").replace(";", ",")
-        val expStr = formatRuDate(it.expDate)
-        val expMs = parseIsoToMillis(it.expDate)
-        val statusStr = when {
-            it.status == "RETIRED" -> "ВЫБЫЛ"
-            expMs != null && expMs <= thresholdMillis -> "ПРОСРОЧКА"
-            expMs != null -> "ГОДЕН"
-            else -> it.infoMsg ?: "БЕЗ ДАТЫ"
-        }
-        sb.appendLine("$cleanName;\"${it.gtin}\";\"${it.sn}\";$expStr;$statusStr;$thrStr")
-    }
-    return sb.toString()
-}
-
-private fun buildMessengerSummary(
-    list: List<ScannedItem>,
-    thresholdMillis: Long,
-    isExpiredFn: (ScannedItem) -> Boolean
-): String {
-    val nowStr = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(Date())
-    val thrStr = SimpleDateFormat("dd.MM.yyyy", Locale.getDefault()).format(Date(thresholdMillis))
-    val expired = list.filter(isExpiredFn)
-
-    val sb = StringBuilder()
-    sb.appendLine("📋 Сводка ревизии (AOR Systems)")
-    sb.appendLine("Дата: $nowStr | Порог: до $thrStr")
-    sb.appendLine("Всего проверено: ${list.size} шт. | На списание: ${expired.size} шт.")
-    sb.appendLine()
-
-    if (expired.isEmpty()) {
-        sb.appendLine("✅ Просроченных позиций не обнаружено.")
-    } else {
-        sb.appendLine("🚨 Позиции на списание:")
-        val grouped = expired.groupBy { (it.name ?: "GTIN ${it.gtin}") to formatRuDate(it.expDate) }
-        var idx = 1
-        for ((key, group) in grouped) {
-            sb.appendLine("$idx. ${key.first} — ${group.size} шт. (до ${key.second})")
-            idx++
-        }
-    }
-    return sb.toString()
 }
